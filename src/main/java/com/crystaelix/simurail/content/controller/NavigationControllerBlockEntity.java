@@ -128,6 +128,36 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		behaviours.add(maxSpeedScroll);
 	}
 
+	private double computeSteerForBogey(PhysicsBogeyBlockEntity bogey, TrackGraph graph,
+										List<TrackNode> path, TrackNode n1, TrackNode n2,
+										boolean movingTowardsNode2, GlobalStation targetStation) {
+		PhysicsBogeyAxle axle = findAnchorAxle(bogey);
+		if (axle == null) return 0.0;
+		TravellingPoint point = axle.getTrackPoint();
+		if (point == null || point.edge == null) return 0.0;
+
+		int idx1 = path.indexOf(point.edge.node1);
+		int idx2 = path.indexOf(point.edge.node2);
+		if (idx1 == -1 && idx2 == -1) return 0.0;
+
+		boolean bogeyMovingTowardsNode2 = idx2 > idx1 || (idx1 == -1 && idx2 != -1);
+		int startIdx = bogeyMovingTowardsNode2 ? Math.max(idx2, idx1) : Math.max(idx1, idx2);
+
+		Vec3 requiredDir = bogeyMovingTowardsNode2
+				? point.edge.node2.getLocation().getLocation().subtract(point.edge.node1.getLocation().getLocation()).normalize()
+				: point.edge.node1.getLocation().getLocation().subtract(point.edge.node2.getLocation().getLocation()).normalize();
+
+		Vec3 lookahead = getLookaheadTangent(graph, point, path, startIdx, bogeyMovingTowardsNode2, 16.0);
+		if (lookahead == Vec3.ZERO) return 0.0;
+
+		double cross = requiredDir.x * lookahead.z - requiredDir.z * lookahead.x;
+		double steer = Math.clamp(cross * 3.0, -1.0, 1.0);
+
+		Vec3 bogeyForward = Vec3.atLowerCornerOf(bogey.getFacing().getNormal());
+		if (requiredDir.dot(bogeyForward) < 0) steer *= -1;
+		return steer;
+	}
+
 	@Override
 	public void tick() {
 		super.tick();
@@ -166,20 +196,44 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		double brakeStrength = 0.0;
 		float newMultiplier = 0.0f;
-		double steerValue = 0.0;
+		boolean hasValidPath = false;
+		TrackGraph graph = null;
+		List<TrackNode> pathForSteering = currentPath;
+		TrackNode n1ForSteering = null;
+		TrackNode n2ForSteering = null;
+		boolean movingTowardsNode2ForSteering = false;
+		boolean movingTowardsNode2 = false;
 
 		if (target != null && hasSource()) {
 			PhysicsBogeyAxle anchor = findAnchorAxle(anchorBogey);
 			if (anchor != null) {
 				TravellingPoint point = anchor.getTrackPoint();
-				TrackGraph graph = anchor.getTrackGraph();
+				graph = anchor.getTrackGraph();
 
 				if (graph != null && point != null && point.edge != null) {
+					TrackNode n1 = point.edge.node1;
+					TrackNode n2 = point.edge.node2;
+
+					double trackSpeed = anchor.getTrackSpeed();
+					boolean trackReversed = anchor.isTrackReversed();
+					movingTowardsNode2 = (trackSpeed > 0.05) ^ trackReversed;
+					boolean movingTowardsNode1 = (trackSpeed < -0.05) ^ trackReversed;
+
+					if (Math.abs(trackSpeed) < 0.01) {
+						movingTowardsNode2 = this.directionSign > 0;
+					}
+
+					Vec3 edgeForward = n2.getLocation().getLocation().subtract(n1.getLocation().getLocation()).normalize();
+					Vec3 travelDir = movingTowardsNode2 ? edgeForward : edgeForward.scale(-1);
+					Vec3 axleForward = trackReversed ? edgeForward.scale(-1) : edgeForward;
+
+					double sourceSign = Math.signum(inputSpeed);
+					if (sourceSign == 0) sourceSign = 1;
+
+					this.directionSign = (travelDir.dot(axleForward) * sourceSign > 0) ? 1 : -1;
+
 					TrackNode targetNode = getTargetNode(graph, target.station);
 					if (targetNode != null) {
-						TrackNode n1 = point.edge.node1;
-						TrackNode n2 = point.edge.node2;
-
 						TrackNode primaryNode = null, secondaryNode = null;
 						if (target.station.edgeLocation != null) {
 							TrackNode sN1 = graph.locateNode(target.station.edgeLocation.getFirst());
@@ -215,11 +269,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								path2 = findPath(graph, n2, targetNode);
 							}
 
-							double trackSpeed = anchor.getTrackSpeed();
-							boolean trackReversed = anchor.isTrackReversed();
-							boolean movingTowardsNode2 = (trackSpeed > 0.05) ^ trackReversed;
-							boolean movingTowardsNode1 = (trackSpeed < -0.05) ^ trackReversed;
-
 							boolean path1Valid = pathRespectsAllStationDirections(graph, path1, point, movingTowardsNode1, target.station);
 							boolean path2Valid = pathRespectsAllStationDirections(graph, path2, point, movingTowardsNode2, target.station);
 
@@ -238,20 +287,17 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							}
 
 							this.lastDistance = Double.NaN;
-
 							idx1 = currentPath.indexOf(n1);
 							idx2 = currentPath.indexOf(n2);
-
-							this.directionSign = 1;
 						}
 
 						if (!currentPath.isEmpty() && (idx1 != -1 || idx2 != -1)) {
-							boolean movingTowardsNode2;
 							if (idx1 != -1 && idx2 != -1) {
 								movingTowardsNode2 = idx2 > idx1;
 							} else {
 								movingTowardsNode2 = (idx2 != -1);
 							}
+							movingTowardsNode2ForSteering = movingTowardsNode2;
 
 							int startIdx = movingTowardsNode2 ? idx2 : idx1;
 							List<TrackNode> remainingPath = currentPath.subList(startIdx, currentPath.size());
@@ -259,32 +305,13 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 							if (distance < FULL_STOP_DISTANCE) {
 								arrivedAtDestination = true;
-
 								Train presentTrain = findTrain(serverLevel, target.station, anchorBogey);
-
 								if (tickConditions(serverLevel, target.entry, presentTrain, target.station)) {
 									advanceEntry(target.schedule, level.registryAccess());
 								}
 								newMultiplier = 0.0f;
 								brakeStrength = 1.0;
-								steerValue = 0.0;
 							} else {
-								Vec3 requiredTrackDir = movingTowardsNode2
-										? n2.getLocation().getLocation().subtract(n1.getLocation().getLocation()).normalize()
-										: n1.getLocation().getLocation().subtract(n2.getLocation().getLocation()).normalize();
-
-								Vec3 lookaheadTangent = getLookaheadTangent(graph, point, currentPath, startIdx, movingTowardsNode2, 16.0);
-								if (lookaheadTangent != Vec3.ZERO) {
-									Vec3 currentDir = requiredTrackDir;
-									double crossProduct = currentDir.x * lookaheadTangent.z - currentDir.z * lookaheadTangent.x;
-									steerValue = Math.clamp(crossProduct * 3.0, -1.0, 1.0);
-
-									Vec3 bogeyForward = Vec3.atLowerCornerOf(anchorBogey.getFacing().getNormal());
-									if (currentDir.dot(bogeyForward) < 0) {
-										steerValue *= -1;
-									}
-								}
-
 								arrivedAtDestination = false;
 								resetConditionProgress();
 
@@ -301,13 +328,18 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 								if (distance <= brakeStart) {
 									double brakeRamp = (distance - FULL_STOP_DISTANCE) / Math.max(0.01, brakeStart - FULL_STOP_DISTANCE);
-									brakeStrength = Math.clamp(1.0 - brakeRamp, 0.0, 0.85);
+									brakeStrength = Math.clamp(1.0 - brakeRamp, 0.0, 1.0);
 								} else {
 									brakeStrength = 0.0;
 								}
 
 								lastDistance = distance;
 							}
+
+							n1ForSteering = n1;
+							n2ForSteering = n2;
+							pathForSteering = currentPath;
+							hasValidPath = true;
 						}
 					}
 				}
@@ -318,10 +350,35 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			currentPath = Collections.emptyList();
 			newMultiplier = 0.0f;
 			brakeStrength = 1.0;
+			this.directionSign = 1;
+		}
+
+		PhysicsBogeyBlockEntity frontBogey = null;
+		if (hasValidPath && n1ForSteering != null && n2ForSteering != null) {
+			Vec3 edgeForward = n2ForSteering.getLocation().getLocation().subtract(n1ForSteering.getLocation().getLocation()).normalize();
+			Vec3 travelDir = movingTowardsNode2ForSteering ? edgeForward : edgeForward.scale(-1);
+
+			double maxDot = -Double.MAX_VALUE;
+			for (PhysicsBogeyBlockEntity bogey : consist) {
+				Vec3 bogeyPos = Vec3.atCenterOf(bogey.getBlockPos());
+				double dot = bogeyPos.dot(travelDir);
+				if (dot > maxDot) {
+					maxDot = dot;
+					frontBogey = bogey;
+				}
+			}
 		}
 
 		for (PhysicsBogeyBlockEntity bogey : consist) {
-			bogey.setNavigationSteerOverride(steerValue);
+			bogey.clearNavigationOverride();
+
+			if (bogey == frontBogey && hasValidPath && target != null && graph != null
+					&& n1ForSteering != null && n2ForSteering != null) {
+				double steer = computeSteerForBogey(bogey, graph, pathForSteering,
+						n1ForSteering, n2ForSteering,
+						movingTowardsNode2ForSteering, target.station);
+				bogey.setNavigationSteerOverride(steer);
+			}
 			bogey.setNavigationBrakeOverride(brakeStrength);
 		}
 
@@ -426,7 +483,18 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 			Map<TrackNode, TrackEdge> connections = graph.getConnectionsFrom(current);
 			if (connections != null) {
-				for (TrackNode nextNode : connections.keySet()) {
+				for (Map.Entry<TrackNode, TrackEdge> entry : connections.entrySet()) {
+					TrackNode nextNode = entry.getKey();
+					TrackEdge edge = entry.getValue();
+
+					GlobalStation station = findStationOnEdge(graph, edge, null);
+					if (station != null) {
+						boolean movingTowards = edge.node2.equals(nextNode);
+						if (!traversesStationCorrectly(edge, movingTowards, station)) {
+							continue;
+						}
+					}
+
 					if (!cameFrom.containsKey(nextNode)) {
 						cameFrom.put(nextNode, current);
 						queue.add(nextNode);
@@ -456,8 +524,19 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			if (connections != null) {
 				for (Map.Entry<TrackNode, TrackEdge> entry : connections.entrySet()) {
 					TrackNode nextNode = entry.getKey();
+					TrackEdge edge = entry.getValue();
+
 					if ((current == avoidA && nextNode == avoidB) || (current == avoidB && nextNode == avoidA))
 						continue;
+
+					GlobalStation station = findStationOnEdge(graph, edge, null);
+					if (station != null) {
+						boolean movingTowards = edge.node2.equals(nextNode);
+						if (!traversesStationCorrectly(edge, movingTowards, station)) {
+							continue;
+						}
+					}
+
 					if (!cameFrom.containsKey(nextNode)) {
 						cameFrom.put(nextNode, current);
 						queue.add(nextNode);
@@ -488,8 +567,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 		}
 
-		if (stationEdge != null && stationEdge == start.edge) {
-			return Math.abs(start.position - stationPosOnEdge);
+		if (stationEdge != null && start.edge != null &&
+				((start.edge.node1 == stationEdge.node1 && start.edge.node2 == stationEdge.node2) ||
+						(start.edge.node1 == stationEdge.node2 && start.edge.node2 == stationEdge.node1))) {
+			double startPos = start.position;
+			if (start.edge.node1 != stationEdge.node1) {
+				startPos = start.edge.getLength() - start.position;
+			}
+			return Math.abs(startPos - stationPosOnEdge);
 		}
 
 		distance = movingTowardsNode2 ? (start.edge.getLength() - start.position) : start.position;
@@ -500,8 +585,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			TrackEdge edge = graph.getConnection(Couple.create(p1, p2));
 			double edgeLength = (edge != null) ? edge.getLength() : p1.getLocation().getLocation().distanceTo(p2.getLocation().getLocation());
 
-			if (i == path.size() - 2 && stationEdge != null && stationEdge == edge) {
-				if (p1 == edge.node1) {
+			if (i == path.size() - 2 && stationEdge != null && edge != null &&
+					((edge.node1 == stationEdge.node1 && edge.node2 == stationEdge.node2) ||
+							(edge.node1 == stationEdge.node2 && edge.node2 == stationEdge.node1))) {
+				if (p1 == stationEdge.node1) {
 					edgeLength = stationPosOnEdge;
 				} else {
 					edgeLength = edge.getLength() - stationPosOnEdge;
@@ -517,7 +604,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				TrackNode p1 = path.get(path.size() - 2);
 				TrackNode p2 = path.get(path.size() - 1);
 				TrackEdge lastEdge = graph.getConnection(Couple.create(p1, p2));
-				if (lastEdge == stationEdge) alreadyOnStationEdge = true;
+				if (lastEdge != null && ((lastEdge.node1 == stationEdge.node1 && lastEdge.node2 == stationEdge.node2) ||
+						(lastEdge.node1 == stationEdge.node2 && lastEdge.node2 == stationEdge.node1))) {
+					alreadyOnStationEdge = true;
+				}
 			}
 			if (!alreadyOnStationEdge) {
 				if (secondaryNode == stationEdge.node1) {
@@ -531,10 +621,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return Math.max(0.0, distance);
 	}
 
-	/**
-	 * Returns the direction of the immediate next edge in the path.
-	 * This guarantees an immediate steering response at junctions.
-	 */
 	private Vec3 getLookaheadTangent(TrackGraph graph, TravellingPoint start, List<TrackNode> path,
 									 int startIdx, boolean movingTowardsNode2, double lookaheadDistance) {
 		if (start.edge == null || path.isEmpty()) return Vec3.ZERO;
@@ -554,36 +640,36 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				.subtract(start.edge.node2.getLocation().getLocation()).normalize();
 	}
 
-	/**
-	 * Helper to get a station's edge from its edgeLocation.
-	 */
 	@Nullable
-	private TrackEdge getStationEdge(TrackGraph graph, GlobalStation station) {
-		if (station.edgeLocation == null) return null;
-		TrackNode n1 = graph.locateNode(station.edgeLocation.getFirst());
-		TrackNode n2 = graph.locateNode(station.edgeLocation.getSecond());
-		if (n1 == null || n2 == null) return null;
-		return graph.getConnection(Couple.create(n1, n2));
+	private GlobalStation findStationOnEdge(TrackGraph graph, TrackEdge edge, GlobalStation exclude) {
+		for (GlobalStation station : graph.getPoints(EdgePointType.STATION)) {
+			if (station == exclude) continue;
+			if (station.edgeLocation == null) continue;
+
+			TrackNode sN1 = graph.locateNode(station.edgeLocation.getFirst());
+			TrackNode sN2 = graph.locateNode(station.edgeLocation.getSecond());
+			if (sN1 == null || sN2 == null) continue;
+
+			if ((edge.node1 == sN1 && edge.node2 == sN2) || (edge.node1 == sN2 && edge.node2 == sN1)) {
+				return station;
+			}
+		}
+		return null;
 	}
 
 	/**
-	 * Checks if a path, when traversed from the current point, respects the direction (primary->secondary)
-	 * of every station that lies on it (except the target station).
+	 * FIXED: Removed the check for start.edge (currentEdge).
+	 * The train is already parked on this edge. It doesn't need to "approach" it correctly;
+	 * it just needs to leave it. Checking it caused the path to be falsely invalidated
+	 * because leaving a station looks like an "incorrect approach" to the validator.
 	 */
 	private boolean pathRespectsAllStationDirections(TrackGraph graph, List<TrackNode> path,
 													 TravellingPoint start, boolean movingTowardsNode2,
 													 GlobalStation targetStation) {
-		if (path.isEmpty()) return true;
+		if (path.isEmpty() || start.edge == null) return true;
 
-		TrackEdge currentEdge = start.edge;
-		if (currentEdge != null) {
-			GlobalStation station = findStationOnEdge(graph, currentEdge, targetStation);
-			if (station != null && !traversesStationCorrectly(currentEdge, movingTowardsNode2, station)) {
-				return false;
-			}
-		}
+		TrackNode prevNode = movingTowardsNode2 ? start.edge.node2 : start.edge.node1;
 
-		TrackNode prevNode = movingTowardsNode2 ? currentEdge.node2 : currentEdge.node1;
 		for (TrackNode nextNode : path) {
 			if (prevNode.equals(nextNode)) continue;
 			TrackEdge edge = graph.getConnection(Couple.create(prevNode, nextNode));
@@ -599,18 +685,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			prevNode = nextNode;
 		}
 		return true;
-	}
-
-	@Nullable
-	private GlobalStation findStationOnEdge(TrackGraph graph, TrackEdge edge, GlobalStation exclude) {
-		for (GlobalStation station : graph.getPoints(EdgePointType.STATION)) {
-			if (station == exclude) continue;
-			TrackEdge stationEdge = getStationEdge(graph, station);
-			if (stationEdge != null && stationEdge.equals(edge)) {
-				return station;
-			}
-		}
-		return null;
 	}
 
 	private boolean traversesStationCorrectly(TrackEdge edge, boolean movingTowardsNode2, GlobalStation station) {

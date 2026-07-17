@@ -114,6 +114,18 @@ public class PhysicsBogeyAxle {
 		this.logicalFront = logicalFront;
 	}
 
+	public double getkLateralSigned() {
+		return kLateralSigned;
+	}
+
+	public double getkLateral() {
+		return kLateral;
+	}
+
+	public TrackSegment getTrackSegment() {
+		return trackSegment;
+	}
+
 	protected void init(ServerSubLevel subLevel) {
 		double latOffset = bogey.options.type.axleSpacing() / 2;
 		vertOffset = bogey.options.getAxleOffset();

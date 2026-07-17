@@ -36,8 +36,8 @@ public class PhysicsBogeyOptionsScreen extends PhysicsBogeyBaseScreen {
 			Component.translatable("gui.simurail.physics_bogey.physics.enabled"),
 			Component.translatable("gui.simurail.physics_bogey.physics.disabled"));
 	public static final List<Component> ROTATION_OPTIONS = List.of(
-			Component.translatable("gui.simurail.physics_bogey.rotation.disallow"),
 			Component.translatable("gui.simurail.physics_bogey.rotation.allow"),
+			Component.translatable("gui.simurail.physics_bogey.rotation.disallow"),
 			Component.translatable("gui.simurail.physics_bogey.rotation.yaw"),
 			Component.translatable("gui.simurail.physics_bogey.rotation.pitch"));
 	public static final List<Component> OFFSET_OPTIONS = List.of(
