@@ -543,7 +543,8 @@ public class PhysicsBogeyAxle {
 			double brakeStrength = bogey.getBrakeStrength();
 
 			double targetSpeedFactor = config.axleTargetSpeedFactor.get();
-			targetSpeed = bogey.getSpeed() * targetSpeedFactor * bogey.getFacing().getAxisDirection().getStep() * bogey.getStressSign();
+			double targetRPM = bogey.getSpeed();
+			targetSpeed = targetRPM * targetSpeedFactor * bogey.getFacing().getAxisDirection().getStep() * bogey.getStressSign();
 			double targetSign = Math.signum(targetSpeed);
 			double diffSpeed = targetSpeed - speed;
 			double diffSign = Math.signum(diffSpeed);
@@ -601,7 +602,8 @@ public class PhysicsBogeyAxle {
 
 		SimurailPhysicsConfig config = SimurailConfig.server().physics;
 		double targetSpeedFactor = config.axleTargetSpeedFactor.get();
-		targetSpeed = bogey.getSpeed() * targetSpeedFactor * bogey.getFacing().getAxisDirection().getStep() * bogey.getStressSign();
+		double targetRPM = bogey.getSpeed();
+		targetSpeed = targetRPM * targetSpeedFactor * bogey.getFacing().getAxisDirection().getStep() * bogey.getStressSign();
 
 		if(clipResult.getType() != HitResult.Type.BLOCK) {
 			if(targetSpeed != 0) {
@@ -807,7 +809,7 @@ public class PhysicsBogeyAxle {
 			Vector3d trackLat = trackAxleFrame.lateral;
 
 			Vector3d steerTarget = new Vector3d();
-			steerTarget.fma(forward ? 1 : -1, trackDir);
+			steerTarget.set(trackDir);
 			steerTarget.fma(steerValue, trackLat);
 
 			Vector3d checkDir = new Vector3d();
@@ -900,6 +902,32 @@ public class PhysicsBogeyAxle {
 
 	public boolean hasTrack() {
 		return trackSegment != null;
+	}
+
+	public double getTrackSpeed() {
+		return speed;
+	}
+
+	public boolean isTrackReversed() {
+		return trackReversed;
+	}
+
+	/**
+	 * The live {@link TrackGraph} this axle is currently resolved onto, or {@code null} if it isn't
+	 * currently associated with any graph (derailed, unloaded, off-track). Read-only for external callers -
+	 * only this axle's own tick logic should ever assign it.
+	 */
+	public TrackGraph getTrackGraph() {
+		return trackGraph;
+	}
+
+	/**
+	 * The axle's own live {@link TravellingPoint} (node1/node2/edge/position on {@link #getTrackGraph()}).
+	 * This is the same object the physics engine mutates every tick - treat it as read-only from outside
+	 * this class; copy the fields you need rather than mutating them.
+	 */
+	public TravellingPoint getTrackPoint() {
+		return trackPoint;
 	}
 
 	protected CompoundTag write() {

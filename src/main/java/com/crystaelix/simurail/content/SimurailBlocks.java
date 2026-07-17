@@ -6,12 +6,18 @@ import com.crystaelix.simurail.content.automatic_coupler.AutomaticCouplerBlockIt
 import com.crystaelix.simurail.content.bogey.PhysicsBogeyBlock;
 import com.crystaelix.simurail.content.bogey.PhysicsBogeyBlockItem;
 import com.crystaelix.simurail.content.gangway_frame.GangwayFrameBlock;
+import com.crystaelix.simurail.content.controller.NavigationControllerBlock;
 import com.simibubi.create.foundation.data.CreateRegistrate;
 import com.simibubi.create.foundation.data.SharedProperties;
 import com.tterrag.registrate.util.entry.BlockEntry;
 
+import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.block.SoundType;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.MapColor;
+import net.neoforged.neoforge.client.model.generators.ConfiguredModel;
+import net.neoforged.neoforge.client.model.generators.ModelFile;
 
 public class SimurailBlocks {
 
@@ -24,6 +30,7 @@ public class SimurailBlocks {
 			item(PhysicsBogeyBlockItem::new).
 			build().
 			register();
+
 	public static final BlockEntry<AutomaticCouplerBlock> AUTOMATIC_COUPLER = REGISTRATE.
 			block("automatic_coupler", AutomaticCouplerBlock::new).
 			initialProperties(SharedProperties::softMetal).
@@ -31,12 +38,20 @@ public class SimurailBlocks {
 			item(AutomaticCouplerBlockItem::new).
 			build().
 			register();
+
 	public static final BlockEntry<GangwayFrameBlock> GANGWAY_FRAME = REGISTRATE.
 			block("gangway_frame", GangwayFrameBlock::new).
 			initialProperties(SharedProperties::softMetal).
 			properties(p -> p.noOcclusion().dynamicShape().mapColor(MapColor.NONE).sound(SoundType.METAL)).
 			simpleItem().
 			register();
+
+	public static final BlockEntry<NavigationControllerBlock> NAVIGATION_CONTROLLER = REGISTRATE
+			.block("navigation_controller", NavigationControllerBlock::new)
+			.initialProperties(SharedProperties::softMetal)
+			.properties(p -> p.mapColor(MapColor.COLOR_LIGHT_BLUE).sound(SoundType.METAL).noOcclusion())
+			.simpleItem()
+			.register();
 
 	public static void register() {
 	}

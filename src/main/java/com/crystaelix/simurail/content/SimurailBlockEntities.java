@@ -9,6 +9,7 @@ import com.crystaelix.simurail.content.bogey.PhysicsBogeyRenderer;
 import com.crystaelix.simurail.content.bogey.PhysicsBogeyVisual;
 import com.crystaelix.simurail.content.gangway_frame.GangwayFrameBlockEntity;
 import com.crystaelix.simurail.content.gangway_frame.GangwayFrameRenderer;
+import com.crystaelix.simurail.content.controller.NavigationControllerBlockEntity;
 import com.simibubi.create.foundation.data.CreateRegistrate;
 import com.tterrag.registrate.util.entry.BlockEntityEntry;
 
@@ -23,17 +24,26 @@ public class SimurailBlockEntities {
 			validBlocks(SimurailBlocks.PHYSICS_BOGEY).
 			registerCapability(PhysicsBogeyBlockEntity::registerCapabilities).
 			register();
+
 	public static final BlockEntityEntry<AutomaticCouplerBlockEntity> COUPLER = REGISTRATE.
 			blockEntity("coupler", AutomaticCouplerBlockEntity::new).
 			visual(() -> AutomaticCouplerVisual::new).
 			renderer(() -> AutomaticCouplerRenderer::new).
 			validBlocks(SimurailBlocks.AUTOMATIC_COUPLER).
 			register();
+
 	public static final BlockEntityEntry<GangwayFrameBlockEntity> GANGWAY_FRAME = REGISTRATE.
 			blockEntity("gangway_frame", GangwayFrameBlockEntity::new).
 			renderer(() -> GangwayFrameRenderer::new).
 			validBlocks(SimurailBlocks.GANGWAY_FRAME).
 			register();
+
+	public static final BlockEntityEntry<NavigationControllerBlockEntity> NAVIGATION_CONTROLLER = REGISTRATE
+			.blockEntity("navigation_controller", NavigationControllerBlockEntity::new)
+			.visual(() -> com.simibubi.create.content.kinetics.transmission.SplitShaftVisual::new, false)
+			.renderer(() -> com.simibubi.create.content.kinetics.base.KineticBlockEntityRenderer::new)
+			.validBlocks(SimurailBlocks.NAVIGATION_CONTROLLER)
+			.register();
 
 	public static void register() {
 	}

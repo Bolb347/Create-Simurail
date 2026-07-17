@@ -1,0 +1,6 @@
+{
+  "variants": {
+    "axis=x": { "model": "simurail:block/navigation_controller", "x": 90, "y": 90 },
+    "axis=z": { "model": "simurail:block/navigation_controller", "x": 90 }
+  }
+}

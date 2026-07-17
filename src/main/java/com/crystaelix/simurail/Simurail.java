@@ -21,6 +21,8 @@ import com.tterrag.registrate.util.nullness.NonNullSupplier;
 
 import dev.simulated_team.simulated.registrate.SimulatedRegistrate;
 import net.createmod.catnip.config.ConfigBase;
+import net.minecraft.client.renderer.ItemBlockRenderTypes;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.CreativeModeTab;
@@ -29,7 +31,9 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.config.ModConfigEvent;
+import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.neoforged.neoforge.registries.RegisterEvent;
 
 @Mod(Simurail.MOD_ID)
 public class Simurail {
@@ -49,7 +53,6 @@ public class Simurail {
 		SimurailSoundEvents.register(modEventBus);
 		SimurailForceGroups.register(modEventBus);
 		SimurailPackets.register();
-
 		SimurailConfig.register(modContainer);
 
 		SimurailCompat.ELECTROENERGETICS.ifLoaded(() -> () -> SimurailElectroEnergeticsCompat.onConstruct(modEventBus));
@@ -84,6 +87,16 @@ public class Simurail {
 				config.onReload();
 			}
 		}
+	}
+
+	@SubscribeEvent
+	public void onClientSetup(FMLClientSetupEvent event) {
+		event.enqueueWork(() -> {
+			ItemBlockRenderTypes.setRenderLayer(
+					SimurailBlocks.NAVIGATION_CONTROLLER.get(),
+					net.minecraft.client.renderer.RenderType.cutoutMipped()
+			);
+		});
 	}
 
 	public static CreateRegistrate registrate() {

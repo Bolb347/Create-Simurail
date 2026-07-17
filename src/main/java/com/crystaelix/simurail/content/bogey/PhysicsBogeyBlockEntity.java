@@ -3,6 +3,7 @@ package com.crystaelix.simurail.content.bogey;
 import java.util.List;
 import java.util.UUID;
 
+import net.minecraft.world.level.Level;
 import org.joml.Quaterniond;
 import org.joml.Quaterniondc;
 import org.joml.Quaternionf;
@@ -66,6 +67,9 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Nameable, MenuProvider, BlockEntitySubLevelActor, SteeringConnectable {
 
@@ -88,6 +92,18 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 	protected CompoundTag bogeyData;
 	protected AbstractComputerBehaviour computerBehaviour;
 	protected final PhysicsBogeyControlOverrides computerOverrides = new PhysicsBogeyControlOverrides();
+
+	/**
+	 * Steer-only override written by a {@code NavigationControllerBlockEntity} once per control interval.
+	 * Deliberately independent of {@link #computerOverrides} - not gated on a ComputerCraft peripheral, since
+	 * a navigation controller is a physical block, not a computer link - and checked ahead of it, since a
+	 * navigation controller is meant to override the bogey's steering entirely while it holds a valid path.
+	 * {@link #navigationOverrideTimeout} decays every tick and the override auto-clears when it hits zero, so
+	 * a controller that's stopped calling {@link #applyNavigationSteerOverride} - removed, unloaded, or the
+	 * consist split away from it - can't leave a bogey permanently steered.
+	 */
+	protected final PhysicsBogeyControlOverrides navigationOverrides = new PhysicsBogeyControlOverrides();
+	protected int navigationOverrideTimeout;
 
 	// Connection components
 	protected BlockPos connectionFront;
@@ -120,6 +136,30 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 	protected double distanceMoved;
 	protected float movementSpeed;
 	protected PhysicsBogeySounds sounds;
+	private double navigationSteerOverride = 0.0;
+	private boolean hasNavigationOverride = false;
+
+	private double navigationBrakeOverride = 0.0;
+	private boolean hasNavigationBrakeOverride = false;
+
+	public void setNavigationBrakeOverride(double value) {
+		this.navigationBrakeOverride = Math.clamp(value, 0, 1);
+		this.hasNavigationBrakeOverride = true;
+	}
+
+	public void clearNavigationBrakeOverride() {
+		this.hasNavigationBrakeOverride = false;
+	}
+
+	public static final Set<PhysicsBogeyBlockEntity> LOADED_BOGEYS = Collections.newSetFromMap(new WeakHashMap<>());
+
+	@Override
+	public void setLevel(Level level) {
+		super.setLevel(level);
+		if (level != null && !level.isClientSide()) {
+			LOADED_BOGEYS.add(this);
+		}
+	}
 
 	public PhysicsBogeyBlockEntity(BlockEntityType<?> typeIn, BlockPos pos, BlockState state) {
 		super(typeIn, pos, state);
@@ -166,6 +206,39 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 		return options;
 	}
 
+	public BlockPos getConnectionFront() {
+		return connectionFront;
+	}
+
+	public BlockPos getConnectionBack() {
+		return connectionBack;
+	}
+
+	public boolean isConnectionFrontToFront() {
+		return connectionFrontToFront;
+	}
+
+	public boolean isConnectionBackToFront() {
+		return connectionBackToFront;
+	}
+
+	public UUID getConnectionFrontSubLevelID() {
+		return connectionFrontSubLevelID;
+	}
+
+	public UUID getConnectionBackSubLevelID() {
+		return connectionBackSubLevelID;
+	}
+
+	public void setNavigationSteerOverride(double value) {
+		this.navigationSteerOverride = value;
+		this.hasNavigationOverride = true;
+	}
+
+	public void clearNavigationOverride() {
+		this.hasNavigationOverride = false;
+	}
+
 	public void setOptions(PhysicsBogeyOptions options) {
 		if(computerBehaviour.hasAttachedComputer()) {
 			this.options.setNonComputer(options);
@@ -184,6 +257,17 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 
 	public PhysicsBogeyControlOverrides getComputerOverrides() {
 		return computerOverrides;
+	}
+
+	/**
+	 * Called by a {@code NavigationControllerBlockEntity} once per control interval to steer this bogey
+	 * toward its current destination. Refreshes {@link #navigationOverrideTimeout}, so the caller must keep
+	 * calling this at least once every {@code timeoutTicks} to hold the override; letting it lapse (controller
+	 * removed, consist split, no path found) returns full manual/redstone steering automatically.
+	 */
+	public void applyNavigationSteerOverride(double steerValue, int timeoutTicks) {
+		navigationOverrides.setSteerValue(steerValue);
+		navigationOverrideTimeout = timeoutTicks;
 	}
 
 	@Override
@@ -478,6 +562,9 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 			if(!computerBehaviour.hasAttachedComputer() && computerOverrides.hasOverrides()) {
 				computerOverrides.reset();
 			}
+			if(navigationOverrideTimeout > 0 && --navigationOverrideTimeout == 0) {
+				navigationOverrides.reset();
+			}
 			if(Sable.HELPER.getContaining(this) instanceof ServerSubLevel) {
 				axleFront.updateVisualSpeed();
 				axleBack.updateVisualSpeed();
@@ -717,30 +804,37 @@ public class PhysicsBogeyBlockEntity extends KineticBlockEntity implements Namea
 	}
 
 	public double getControlStrength() {
-		return Math.clamp((isInverted() ? level.getSignal(getBlockPos().below(), Direction.DOWN) : level.getSignal(getBlockPos().above(), Direction.UP)) / 15D, 0, 1);
+		return Math.clamp((isInverted()
+				? level.getSignal(getBlockPos().below(), Direction.DOWN)
+				: level.getSignal(getBlockPos().above(), Direction.UP)) / 15D, 0, 1);
 	}
 
 	public double getBrakeStrength() {
-		if(computerBehaviour.hasAttachedComputer() && computerOverrides.overrideBrakeStrength) {
+		if (hasNavigationBrakeOverride) return navigationBrakeOverride;
+		if (computerBehaviour.hasAttachedComputer() && computerOverrides.overrideBrakeStrength)
 			return computerOverrides.getBrakeStrength();
-		}
-		return switch(options.controlMode) {
-		case BRAKING -> getControlStrength();
-		case BRAKING_INVERTED -> 1 - getControlStrength();
-		case null, default -> 0;
+		return switch (options.controlMode) {
+			case BRAKING -> getControlStrength();
+			case BRAKING_INVERTED -> 1 - getControlStrength();
+			case null, default -> 0;
 		};
 	}
 
 	public double getSteerValue() {
+		if (hasNavigationOverride) {
+			return Math.clamp(navigationSteerOverride, -1, 1);
+		}
+
 		if(computerBehaviour.hasAttachedComputer() && computerOverrides.overrideSteerValue) {
 			return computerOverrides.getSteerValue();
 		}
+
 		int value = switch(getFacing()) {
-		case EAST -> level.getSignal(getBlockPos().south(), Direction.SOUTH) - level.getSignal(getBlockPos().north(), Direction.NORTH);
-		case WEST -> level.getSignal(getBlockPos().north(), Direction.NORTH) - level.getSignal(getBlockPos().south(), Direction.SOUTH);
-		case SOUTH -> level.getSignal(getBlockPos().west(), Direction.WEST) - level.getSignal(getBlockPos().east(), Direction.EAST);
-		case NORTH -> level.getSignal(getBlockPos().east(), Direction.EAST) - level.getSignal(getBlockPos().west(), Direction.WEST);
-		case null, default -> throw new IllegalArgumentException("Unexpected value: " + getFacing());
+			case EAST -> level.getSignal(getBlockPos().south(), Direction.SOUTH) - level.getSignal(getBlockPos().north(), Direction.NORTH);
+			case WEST -> level.getSignal(getBlockPos().north(), Direction.NORTH) - level.getSignal(getBlockPos().south(), Direction.SOUTH);
+			case SOUTH -> level.getSignal(getBlockPos().west(), Direction.WEST) - level.getSignal(getBlockPos().east(), Direction.EAST);
+			case NORTH -> level.getSignal(getBlockPos().east(), Direction.EAST) - level.getSignal(getBlockPos().west(), Direction.WEST);
+			case null, default -> 0;
 		};
 		return Math.clamp(value / 15D, -1, 1);
 	}

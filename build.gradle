@@ -166,7 +166,6 @@ sourceSets {
 java {
 	toolchain {
 		languageVersion = JavaLanguageVersion.of(21)
-		vendor = JvmVendorSpec.AZUL
 	}
 	withSourcesJar()
 }
@@ -183,6 +182,11 @@ loom {
 		}
 		client
 		server
+		data {
+			data()
+			property "forge.logging.console.level", "debug"
+			property "fml.earlyprogresswindow", "false"
+		}
 	}
 }
 

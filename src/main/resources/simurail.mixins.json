@@ -10,6 +10,7 @@
 		"GlobalRailwayManagerMixin",
 		"ObservedTrainNameSourceMixin",
 		"SignalEdgeGroupMixin",
+		"StationBlockEntityMixin",
 		"TrackBlockMixin",
 		"TrackBlockEntityMixin",
 		"TrackObserverMixin",

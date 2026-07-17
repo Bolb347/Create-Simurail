@@ -174,6 +174,14 @@ public class AutomaticCouplerBlockEntity extends SmartBlockEntity implements Men
 		return GangwayFrame.getNeighbors(this, level, 15).stream().anyMatch(GangwayFrame::isPowered);
 	}
 
+	public BlockPos getConnected() {
+		return connectedPos;
+	}
+
+	public boolean isConnectedFront() {
+		return connectedFront;
+	}
+
 	@Override
 	public AABB getOutline(Direction direction) {
 		return AABB.ofSize(
