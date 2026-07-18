@@ -69,6 +69,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	@Nullable private String lastMatchedStationName;
 
+	@Nullable private GlobalStation currentStation = null;
+	@Nullable private TrackEdge lastStationEdge = null;
+
+	private boolean needsDirectionCorrection = false;
+
 	public NavigationControllerBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState state) {
 		super(type, pos, state);
 	}
@@ -269,8 +274,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								path2 = findPath(graph, n2, targetNode);
 							}
 
-							boolean path1Valid = pathRespectsAllStationDirections(graph, path1, point, movingTowardsNode1, target.station);
-							boolean path2Valid = pathRespectsAllStationDirections(graph, path2, point, movingTowardsNode2, target.station);
+							boolean path1Valid = pathRespectsAllStationDirections(graph, path1, point, movingTowardsNode1, target.station, currentStation);
+							boolean path2Valid = pathRespectsAllStationDirections(graph, path2, point, movingTowardsNode2, target.station, currentStation);
 
 							if (movingTowardsNode2 && path2Valid && !path2.isEmpty()) {
 								currentPath = path2;
@@ -299,11 +304,20 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							}
 							movingTowardsNode2ForSteering = movingTowardsNode2;
 
+							if (needsDirectionCorrection && Math.abs(trackSpeed) < 0.01) {
+								Vec3 requiredTravelDir = movingTowardsNode2 ? edgeForward : edgeForward.scale(-1);
+								int desiredBogeyRotation = (requiredTravelDir.dot(axleForward) > 0) ? 1 : -1;
+								this.directionSign = desiredBogeyRotation * (int) sourceSign;
+								needsDirectionCorrection = false;
+							}
+
 							int startIdx = movingTowardsNode2 ? idx2 : idx1;
 							List<TrackNode> remainingPath = currentPath.subList(startIdx, currentPath.size());
 							double distance = calculatePathDistance(graph, remainingPath, point, movingTowardsNode2, target.station, secondaryNode);
 
 							if (distance < FULL_STOP_DISTANCE) {
+								currentStation = target.station;
+								lastStationEdge = point.edge;
 								arrivedAtDestination = true;
 								Train presentTrain = findTrain(serverLevel, target.station, anchorBogey);
 								if (tickConditions(serverLevel, target.entry, presentTrain, target.station)) {
@@ -312,6 +326,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								newMultiplier = 0.0f;
 								brakeStrength = 1.0;
 							} else {
+								if (currentStation != null && point.edge != lastStationEdge) {
+									currentStation = null;
+									lastStationEdge = null;
+								}
 								arrivedAtDestination = false;
 								resetConditionProgress();
 
@@ -345,6 +363,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				}
 			}
 		} else {
+			currentStation = null;
+			lastStationEdge = null;
 			arrivedAtDestination = false;
 			lastDistance = Double.NaN;
 			currentPath = Collections.emptyList();
@@ -490,7 +510,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 					GlobalStation station = findStationOnEdge(graph, edge, null);
 					if (station != null) {
 						boolean movingTowards = edge.node2.equals(nextNode);
-						if (!traversesStationCorrectly(edge, movingTowards, station)) {
+						if (!traversesStationCorrectly(edge, movingTowards, station, currentStation)) {
 							continue;
 						}
 					}
@@ -532,7 +552,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 					GlobalStation station = findStationOnEdge(graph, edge, null);
 					if (station != null) {
 						boolean movingTowards = edge.node2.equals(nextNode);
-						if (!traversesStationCorrectly(edge, movingTowards, station)) {
+						if (!traversesStationCorrectly(edge, movingTowards, station, currentStation)) {
 							continue;
 						}
 					}
@@ -657,19 +677,21 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return null;
 	}
 
-	/**
-	 * FIXED: Removed the check for start.edge (currentEdge).
-	 * The train is already parked on this edge. It doesn't need to "approach" it correctly;
-	 * it just needs to leave it. Checking it caused the path to be falsely invalidated
-	 * because leaving a station looks like an "incorrect approach" to the validator.
-	 */
 	private boolean pathRespectsAllStationDirections(TrackGraph graph, List<TrackNode> path,
 													 TravellingPoint start, boolean movingTowardsNode2,
-													 GlobalStation targetStation) {
-		if (path.isEmpty() || start.edge == null) return true;
+													 GlobalStation targetStation,
+													 @Nullable GlobalStation currentStation) {
+		if (path.isEmpty()) return true;
 
-		TrackNode prevNode = movingTowardsNode2 ? start.edge.node2 : start.edge.node1;
+		TrackEdge currentEdge = start.edge;
+		if (currentEdge != null) {
+			GlobalStation station = findStationOnEdge(graph, currentEdge, targetStation);
+			if (station != null && !traversesStationCorrectly(currentEdge, movingTowardsNode2, station, currentStation)) {
+				return false;
+			}
+		}
 
+		TrackNode prevNode = movingTowardsNode2 ? currentEdge.node2 : currentEdge.node1;
 		for (TrackNode nextNode : path) {
 			if (prevNode.equals(nextNode)) continue;
 			TrackEdge edge = graph.getConnection(Couple.create(prevNode, nextNode));
@@ -678,7 +700,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			GlobalStation station = findStationOnEdge(graph, edge, targetStation);
 			if (station != null) {
 				boolean movingTowards = edge.node2.equals(nextNode);
-				if (!traversesStationCorrectly(edge, movingTowards, station)) {
+				if (!traversesStationCorrectly(edge, movingTowards, station, currentStation)) {
 					return false;
 				}
 			}
@@ -687,7 +709,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return true;
 	}
 
-	private boolean traversesStationCorrectly(TrackEdge edge, boolean movingTowardsNode2, GlobalStation station) {
+	private boolean traversesStationCorrectly(TrackEdge edge, boolean movingTowardsNode2,
+											  GlobalStation station, @Nullable GlobalStation currentStation) {
+		if (station == currentStation) return true;
 		if (station.isPrimary(edge.node1)) {
 			return movingTowardsNode2;
 		} else if (station.isPrimary(edge.node2)) {
@@ -790,6 +814,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		currentPath = Collections.emptyList();
 		cachedStation = null;
 		cachedTargetNode = null;
+		needsDirectionCorrection = true;
 		schedule.savedProgress = currentEntry;
 		scheduleStack.set(AllDataComponents.TRAIN_SCHEDULE, schedule.write(registries));
 		setChanged();
@@ -828,6 +853,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.currentPath = Collections.emptyList();
 		this.cachedStation = null;
 		this.cachedTargetNode = null;
+		this.currentStation = null;
+		this.lastStationEdge = null;
+		this.needsDirectionCorrection = false;
 		if (level != null) {
 			CompoundTag tag = stack.get(AllDataComponents.TRAIN_SCHEDULE);
 			Schedule schedule = tag != null ? Schedule.fromTag(level.registryAccess(), tag) : new Schedule();
@@ -860,5 +888,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		directionSign = tag.contains("DirectionSign") ? tag.getInt("DirectionSign") : 1;
 		conditionProgress.clear(); for (Tag t : tag.getList("ConditionProgress", Tag.TAG_INT)) conditionProgress.add(((IntTag) t).getAsInt());
 		conditionContext.clear(); for (Tag t : tag.getList("ConditionContext", Tag.TAG_COMPOUND)) conditionContext.add((CompoundTag) t);
+		currentStation = null;
+		lastStationEdge = null;
+		needsDirectionCorrection = false;
 	}
 }
