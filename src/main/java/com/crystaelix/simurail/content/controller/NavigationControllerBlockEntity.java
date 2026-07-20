@@ -99,6 +99,13 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private boolean hasDirectionSignBeenSet = false;
 	private double lastSourceSign = 1.0;
 	private int lastForwardSign = 0;
+	@Nullable
+	private Target currentTarget = null;
+
+	@Nullable
+	private Train cachedTrain = null;
+
+	private long lastConditionTickTime = -1;
 
 	private boolean storagePortsActive = false;
 
@@ -260,11 +267,43 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		if (level == null || level.isClientSide()) return;
 
+		if (arrivedAtDestination && currentTarget != null && level instanceof ServerLevel serverLevel) {
+			tickArrivalConditions(serverLevel);
+		}
+
 		tickCounter++;
 		if (tickCounter < EVALUATE_INTERVAL) return;
 
 		tickCounter = 0;
 		evaluateAndDrive();
+	}
+
+	private void tickArrivalConditions(ServerLevel level) {
+		if (currentTarget == null || currentStation == null) return;
+
+		PhysicsBogeyBlockEntity anchorBogey = findAdjacentBogey();
+		if (anchorBogey == null) return;
+
+		if (cachedTrain == null || level.getGameTime() % 20 == 0) {
+			cachedTrain = findTrain(level, currentTarget.station, anchorBogey);
+		}
+
+		if (tickConditionsOnce(level, currentTarget.entry, cachedTrain, currentTarget.station)) {
+			advanceEntry(currentTarget.schedule, level.registryAccess());
+			deactivateDockingConnectors(level);
+		}
+	}
+
+	private boolean tickConditionsOnce(ServerLevel level, ScheduleEntry entry, @Nullable Train train, GlobalStation station) {
+		long gameTime = level.getGameTime();
+
+		if (gameTime == lastConditionTickTime) {
+			return false;
+		}
+
+		lastConditionTickTime = gameTime;
+
+		return tickConditions(level, entry, train, station);
 	}
 
 	private void evaluateAndDrive() {
@@ -280,6 +319,12 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		Set<PhysicsBogeyBlockEntity> consist = traverseConsist(anchorBogey);
 
 		Target target = resolveDestination(serverLevel, anchorBogey);
+
+		currentTarget = target;
+
+		if (target == null) {
+			cachedTrain = null;
+		}
 
 		double targetRPM = (maxSpeedScroll != null) ? Math.min(maxSpeedScroll.getValue(), 256.0) : 32.0;
 
@@ -527,10 +572,12 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 							arrivedAtDestination = true;
 
-							Train presentTrain = findTrain(serverLevel, target.station, anchorBogey);
+							cachedTrain = findTrain(serverLevel, target.station, anchorBogey);
 
-							if (tickConditions(serverLevel, target.entry, presentTrain, target.station)) {
+							if (tickConditionsOnce(serverLevel, target.entry, cachedTrain, target.station)) {
 								advanceEntry(target.schedule, level.registryAccess());
+								deactivateDockingConnectors(serverLevel);
+								setStoragePortsActive(serverLevel, consist, target.station, false);
 							}
 
 							newMultiplier = 0.0f;
@@ -603,18 +650,20 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			lastForwardSign = 0;
 		}
 
+		boolean shouldDock = arrivedAtDestination;
+
 		setStoragePortsActive(
 				serverLevel,
 				consist,
 				target != null ? target.station : null,
-				stationHoldActive
+				shouldDock
 		);
 
 		updateDockingConnectors(
 				serverLevel,
 				consist,
 				target != null ? target.station : null,
-				arrivedAtDestination || (currentStation != null && lastStationEdge != null)
+				shouldDock
 		);
 
 		PhysicsBogeyBlockEntity frontBogey = null;
@@ -1117,15 +1166,19 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 			dockingConnectorsActive = true;
 		} else if (dockingConnectorsActive || !activatedDockingConnectors.isEmpty()) {
-			for (ConnectorRef ref : activatedDockingConnectors) {
-				if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
-					setDockingConnectorActive(connector, false);
-				}
-			}
-
-			activatedDockingConnectors.clear();
-			dockingConnectorsActive = false;
+			deactivateDockingConnectors(level);
 		}
+	}
+
+	private void deactivateDockingConnectors(ServerLevel level) {
+		for (ConnectorRef ref : activatedDockingConnectors) {
+			if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
+				setDockingConnectorActive(connector, false);
+			}
+		}
+
+		activatedDockingConnectors.clear();
+		dockingConnectorsActive = false;
 	}
 
 	private void setDockingConnectorActive(DockingConnectorBlockEntity connector, boolean active) {
@@ -1140,6 +1193,19 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 
 		connector.powered = active;
+
+		if (!active) {
+			try {
+				connector.setVirtualLock(false);
+			} catch (Throwable ignored) {
+			}
+
+			try {
+				connector.unDock();
+			} catch (Throwable ignored) {
+			}
+		}
+
 		connector.setChanged();
 
 		connectorLevel.sendBlockUpdated(pos, state, connectorLevel.getBlockState(pos), 3);
@@ -1732,6 +1798,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				BlockEntity be = level.getBlockEntity(immutable);
 				if (be == null) continue;
 
+				if (be instanceof DockingConnectorBlockEntity) continue;
+
 				if (be instanceof IStoragePortActivatable || isStoragePortBlockEntity(be)) {
 					consumer.accept(be);
 				}
@@ -1953,7 +2021,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.lastSourceSign = 1.0;
 		this.lastForwardSign = 0;
 
+		this.currentTarget = null;
+		this.cachedTrain = null;
+		this.lastConditionTickTime = -1;
+
 		this.storagePortsActive = false;
+
+		this.activatedDockingConnectors.clear();
+		this.dockingConnectorsActive = false;
 
 		if (level != null) {
 			CompoundTag tag = stack.get(AllDataComponents.TRAIN_SCHEDULE);
@@ -2061,5 +2136,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		currentStation = null;
 		lastStationEdge = null;
+		activatedDockingConnectors.clear();
+		dockingConnectorsActive = false;
 	}
 }
