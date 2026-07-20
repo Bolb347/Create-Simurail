@@ -1,13 +1,18 @@
 package com.crystaelix.simurail.content.controller;
 
+import java.lang.reflect.Method;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 
 import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.Property;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -33,6 +38,8 @@ import com.simibubi.create.foundation.blockEntity.behaviour.BlockEntityBehaviour
 import com.simibubi.create.foundation.blockEntity.behaviour.scrollValue.ScrollValueBehaviour;
 import com.simibubi.create.foundation.blockEntity.behaviour.ValueBoxTransform;
 
+import dev.simulated_team.simulated.content.blocks.docking_connector.DockingConnectorBlockEntity;
+
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
@@ -50,12 +57,10 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.entity.BlockEntityType;
-import net.minecraft.world.level.block.state.BlockState;
 
 public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private static final int EVALUATE_INTERVAL = 5;
-
 	private static final double BRAKE_START_DISTANCE = 128.0;
 	private static final double FULL_STOP_DISTANCE = 1.0;
 	private static final double ARRIVAL_HOLD_DISTANCE = 2.0;
@@ -78,9 +83,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private List<TrackNode> currentPath = Collections.emptyList();
 
-	private GlobalStation cachedStation = null;
-	private TrackNode cachedTargetNode = null;
-
 	@Nullable
 	private String lastMatchedStationName;
 
@@ -90,19 +92,27 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	@Nullable
 	private TrackEdge lastStationEdge = null;
 
-	private boolean needsDirectionCorrection = false;
-
 	private boolean lastMovingTowardsNode2 = true;
 	private boolean hasLastMovingDirection = false;
 
 	private Vec3 lastTravelDir = Vec3.ZERO;
 	private boolean hasDirectionSignBeenSet = false;
 	private double lastSourceSign = 1.0;
-
 	private int lastForwardSign = 0;
+
+	private boolean storagePortsActive = false;
+
+	private boolean dockingConnectorsActive = false;
+	private final Set<ConnectorRef> activatedDockingConnectors = new HashSet<>();
+
+	private record ConnectorRef(ServerLevel level, BlockPos pos) {}
 
 	public NavigationControllerBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState state) {
 		super(type, pos, state);
+	}
+
+	public interface IStoragePortActivatable {
+		void setStoragePortActive(boolean active);
 	}
 
 	@Override
@@ -113,7 +123,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	}
 
 	public int getRedstoneSignal() {
-		return arrivedAtDestination ? 15 : 0;
+		return (arrivedAtDestination || storagePortsActive) ? 15 : 0;
 	}
 
 	public ScrollValueBehaviour maxSpeedScroll;
@@ -285,6 +295,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		float newMultiplier = 0.0f;
 
 		boolean hasValidPath = false;
+		boolean stationHoldActive = false;
 
 		TrackGraph graph = null;
 
@@ -321,7 +332,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 					if (Math.abs(trackSpeed) > 0.05) {
 						movingTowardsNode2 = (trackSpeed > 0.0) ^ trackReversed;
-
 						lastMovingTowardsNode2 = movingTowardsNode2;
 						hasLastMovingDirection = true;
 					} else {
@@ -562,6 +572,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							lastDistance = distance;
 						}
 
+						if (currentStation != null && lastStationEdge != null && sameEdge(point.edge, lastStationEdge)) {
+							stationHoldActive = true;
+						}
+
 						n1ForSteering = n1;
 						n2ForSteering = n2;
 						pathForSteering = currentPath;
@@ -569,11 +583,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 						hasValidPath = true;
 					}
 				}
-			}
-
-			if (!hasValidPath) {
-				newMultiplier = 0.0f;
-				brakeStrength = 1.0;
 			}
 		} else {
 			currentStation = null;
@@ -593,6 +602,20 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			lastSourceSign = 1.0;
 			lastForwardSign = 0;
 		}
+
+		setStoragePortsActive(
+				serverLevel,
+				consist,
+				target != null ? target.station : null,
+				stationHoldActive
+		);
+
+		updateDockingConnectors(
+				serverLevel,
+				consist,
+				target != null ? target.station : null,
+				arrivedAtDestination || (currentStation != null && lastStationEdge != null)
+		);
 
 		PhysicsBogeyBlockEntity frontBogey = null;
 
@@ -646,8 +669,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	@Nullable
 	private Train findTrain(ServerLevel level, GlobalStation station, PhysicsBogeyBlockEntity anchorBogey) {
-		Train present = station.getPresentTrain();
-		if (present != null) return present;
+		try {
+			Train present = station.getPresentTrain();
+			if (present != null) return present;
+		} catch (Throwable ignored) {
+		}
 
 		TrackGraph graph = null;
 
@@ -656,13 +682,25 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		if (graph != null) {
 			for (Train train : Create.RAILWAYS.trains.values()) {
-				if (train.graph == graph && train.navigation.destination == station) {
-					return train;
+				if (train == null) continue;
+
+				try {
+					if (train.graph == graph && train.navigation != null && train.navigation.destination == station) {
+						return train;
+					}
+				} catch (Throwable ignored) {
 				}
 			}
 
 			for (Train train : Create.RAILWAYS.trains.values()) {
-				if (train.graph == graph) return train;
+				if (train == null) continue;
+
+				try {
+					if (train.graph == graph) {
+						return train;
+					}
+				} catch (Throwable ignored) {
+				}
 			}
 		}
 
@@ -688,15 +726,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			setChanged();
 			sendData();
 		}
-	}
-
-	private TrackNode getTargetNode(TrackGraph graph, GlobalStation station) {
-		if (station == cachedStation && cachedTargetNode != null) return cachedTargetNode;
-
-		cachedStation = station;
-		cachedTargetNode = findNearestNodeToStation(graph, station);
-
-		return cachedTargetNode;
 	}
 
 	private TrackNode findNearestNodeToStation(TrackGraph graph, GlobalStation station) {
@@ -1052,6 +1081,71 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 	}
 
+	private void updateDockingConnectors(ServerLevel level, Set<PhysicsBogeyBlockEntity> consist,
+										 @Nullable GlobalStation station, boolean active) {
+		if (active) {
+			Set<BlockPos> seen = new HashSet<>();
+			List<BlockPos> centers = new ArrayList<>();
+
+			centers.add(worldPosition);
+
+			for (PhysicsBogeyBlockEntity bogey : consist) {
+				centers.add(bogey.getBlockPos());
+			}
+
+			if (station != null) {
+				centers.add(station.getBlockEntityPos());
+			}
+
+			int radius = 16;
+
+			for (BlockPos center : centers) {
+				BlockPos min = center.offset(-radius, -radius, -radius);
+				BlockPos max = center.offset(radius, radius, radius);
+
+				for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
+					BlockPos immutable = new BlockPos(pos.getX(), pos.getY(), pos.getZ());
+
+					if (!seen.add(immutable)) continue;
+
+					if (level.getBlockEntity(immutable) instanceof DockingConnectorBlockEntity connector) {
+						setDockingConnectorActive(connector, true);
+						activatedDockingConnectors.add(new ConnectorRef(level, immutable));
+					}
+				}
+			}
+
+			dockingConnectorsActive = true;
+		} else if (dockingConnectorsActive || !activatedDockingConnectors.isEmpty()) {
+			for (ConnectorRef ref : activatedDockingConnectors) {
+				if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
+					setDockingConnectorActive(connector, false);
+				}
+			}
+
+			activatedDockingConnectors.clear();
+			dockingConnectorsActive = false;
+		}
+	}
+
+	private void setDockingConnectorActive(DockingConnectorBlockEntity connector, boolean active) {
+		if (!(connector.getLevel() instanceof ServerLevel connectorLevel)) return;
+
+		BlockPos pos = connector.getBlockPos();
+		BlockState state = connectorLevel.getBlockState(pos);
+
+		if (state.hasProperty(BlockStateProperties.POWERED) && state.getValue(BlockStateProperties.POWERED) != active) {
+			connectorLevel.setBlock(pos, state.setValue(BlockStateProperties.POWERED, active), 3);
+			state = connectorLevel.getBlockState(pos);
+		}
+
+		connector.powered = active;
+		connector.setChanged();
+
+		connectorLevel.sendBlockUpdated(pos, state, connectorLevel.getBlockState(pos), 3);
+		connectorLevel.updateNeighborsAt(pos, state.getBlock());
+	}
+
 	private record Target(
 			Schedule schedule,
 			ScheduleEntry entry,
@@ -1196,7 +1290,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			return level.hasNeighborSignal(station.getBlockEntityPos());
 		}
 
-		return condition.tickCompletion(level, train, context);
+		try {
+			return condition.tickCompletion(level, train, context);
+		} catch (Throwable ignored) {
+			return false;
+		}
 	}
 
 	private void advanceEntry(Schedule schedule, HolderLookup.Provider registries) {
@@ -1211,11 +1309,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		lastDistance = Double.NaN;
 
 		currentPath = Collections.emptyList();
-
-		cachedStation = null;
-		cachedTargetNode = null;
-
-		needsDirectionCorrection = true;
 
 		schedule.savedProgress = currentEntry;
 		scheduleStack.set(AllDataComponents.TRAIN_SCHEDULE, schedule.write(registries));
@@ -1597,6 +1690,231 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		);
 	}
 
+	private void setStoragePortsActive(ServerLevel level, Set<PhysicsBogeyBlockEntity> consist,
+									   @Nullable GlobalStation station, boolean active) {
+		if (active == storagePortsActive) return;
+
+		storagePortsActive = active;
+
+		forEachStorageBlockEntity(level, consist, station, be -> activateStoragePort(level, be, active));
+
+		level.updateNeighborsAt(worldPosition, getBlockState().getBlock());
+		setChanged();
+		sendData();
+	}
+
+	private void forEachStorageBlockEntity(ServerLevel level, Set<PhysicsBogeyBlockEntity> consist,
+										   @Nullable GlobalStation station, Consumer<BlockEntity> consumer) {
+		List<BlockPos> centers = new ArrayList<>();
+
+		centers.add(worldPosition);
+
+		for (PhysicsBogeyBlockEntity bogey : consist) {
+			centers.add(bogey.getBlockPos());
+		}
+
+		if (station != null) {
+			centers.add(station.getBlockEntityPos());
+		}
+
+		Set<BlockPos> scanned = new HashSet<>();
+		int radius = 16;
+
+		for (BlockPos center : centers) {
+			BlockPos min = center.offset(-radius, -radius, -radius);
+			BlockPos max = center.offset(radius, radius, radius);
+
+			for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
+				BlockPos immutable = new BlockPos(pos.getX(), pos.getY(), pos.getZ());
+
+				if (!scanned.add(immutable)) continue;
+
+				BlockEntity be = level.getBlockEntity(immutable);
+				if (be == null) continue;
+
+				if (be instanceof IStoragePortActivatable || isStoragePortBlockEntity(be)) {
+					consumer.accept(be);
+				}
+			}
+		}
+	}
+
+	private boolean isStoragePortBlockEntity(BlockEntity be) {
+		String name = be.getClass().getName().toLowerCase();
+
+		return name.contains("dockingconnector")
+				|| name.contains("dockconnector")
+				|| name.contains("portablestorageinterface")
+				|| name.contains("portablefluidinterface")
+				|| name.contains("airshipstation")
+				|| (name.contains("docking") && name.contains("connector"));
+	}
+
+	private void activateStoragePort(ServerLevel level, BlockEntity be, boolean active) {
+		if (be instanceof IStoragePortActivatable activatable) {
+			try {
+				activatable.setStoragePortActive(active);
+				return;
+			} catch (Throwable ignored) {
+			}
+		}
+
+		try {
+			for (Method method : be.getClass().getMethods()) {
+				if (method.getParameterCount() != 1) continue;
+
+				Class<?> param = method.getParameterTypes()[0];
+				if (param != boolean.class && param != Boolean.class) continue;
+
+				String name = method.getName().toLowerCase();
+
+				if (name.equals("setactive")
+						|| name.equals("setpowered")
+						|| name.equals("setactivated")
+						|| name.equals("setenabled")
+						|| name.equals("setworking")
+						|| name.equals("settransfer")
+						|| name.equals("settransferring")
+						|| name.equals("setconnected")
+						|| name.equals("setdocked")
+						|| name.equals("setdocking")
+						|| name.equals("setengaged")
+						|| name.equals("setlinked")
+						|| name.equals("setonline")
+						|| name.equals("setoperating")
+						|| name.equals("setrunning")) {
+					method.invoke(be, active);
+					finishStoragePortUpdate(level, be);
+					return;
+				}
+
+				if (active && (name.equals("activate")
+						|| name.equals("extend")
+						|| name.equals("connect")
+						|| name.equals("dock")
+						|| name.equals("enable")
+						|| name.equals("engage")
+						|| name.equals("link")
+						|| name.equals("start")
+						|| name.equals("starttransfer"))) {
+					method.invoke(be, true);
+					finishStoragePortUpdate(level, be);
+					return;
+				}
+
+				if (!active && (name.equals("deactivate")
+						|| name.equals("release")
+						|| name.equals("disconnect")
+						|| name.equals("undock")
+						|| name.equals("disable")
+						|| name.equals("disengage")
+						|| name.equals("unlink")
+						|| name.equals("stop")
+						|| name.equals("stoptransfer"))) {
+					method.invoke(be, false);
+					finishStoragePortUpdate(level, be);
+					return;
+				}
+			}
+
+			for (Method method : be.getClass().getMethods()) {
+				if (method.getParameterCount() != 0) continue;
+
+				String name = method.getName().toLowerCase();
+
+				if (active && (name.equals("activate")
+						|| name.equals("extend")
+						|| name.equals("connect")
+						|| name.equals("dock")
+						|| name.equals("enable")
+						|| name.equals("engage")
+						|| name.equals("link")
+						|| name.equals("start")
+						|| name.equals("starttransfer"))) {
+					method.invoke(be);
+					finishStoragePortUpdate(level, be);
+					return;
+				}
+
+				if (!active && (name.equals("deactivate")
+						|| name.equals("release")
+						|| name.equals("disconnect")
+						|| name.equals("undock")
+						|| name.equals("disable")
+						|| name.equals("disengage")
+						|| name.equals("unlink")
+						|| name.equals("stop")
+						|| name.equals("stoptransfer"))) {
+					method.invoke(be);
+					finishStoragePortUpdate(level, be);
+					return;
+				}
+			}
+
+			if (active) {
+				for (Method method : be.getClass().getMethods()) {
+					if (method.getParameterCount() != 0) continue;
+
+					String name = method.getName().toLowerCase();
+
+					if (name.equals("redstonepulse")
+							|| name.equals("pulse")
+							|| name.equals("onredstone")
+							|| name.equals("onredstonesignal")
+							|| name.equals("redstonechanged")
+							|| name.equals("onpowered")) {
+						method.invoke(be);
+						finishStoragePortUpdate(level, be);
+						return;
+					}
+				}
+			}
+
+			if (trySetBooleanProperty(level, be, active,
+					"powered", "active", "activated", "enabled", "connected",
+					"docked", "docking", "engaged", "linked", "online",
+					"operating", "running", "working", "transfer", "transferring")) {
+				finishStoragePortUpdate(level, be);
+				return;
+			}
+		} catch (Throwable ignored) {
+		}
+
+		finishStoragePortUpdate(level, be);
+	}
+
+	private boolean trySetBooleanProperty(ServerLevel level, BlockEntity be, boolean active, String... names) {
+		BlockState state = be.getBlockState();
+		Set<String> wanted = new HashSet<>(Arrays.asList(names));
+
+		boolean changed = false;
+
+		for (Property<?> prop : state.getProperties()) {
+			if (prop.getValueClass() == Boolean.class && wanted.contains(prop.getName().toLowerCase())) {
+				@SuppressWarnings("unchecked")
+				Property<Boolean> boolProp = (Property<Boolean>) prop;
+
+				if (state.getValue(boolProp) != active) {
+					level.setBlock(be.getBlockPos(), state.setValue(boolProp, active), 3);
+					changed = true;
+				}
+			}
+		}
+
+		return changed;
+	}
+
+	private void finishStoragePortUpdate(ServerLevel level, BlockEntity be) {
+		try {
+			be.setChanged();
+
+			BlockState state = be.getBlockState();
+			level.sendBlockUpdated(be.getBlockPos(), state, state, 3);
+			level.updateNeighborsAt(be.getBlockPos(), state.getBlock());
+		} catch (Throwable ignored) {
+		}
+	}
+
 	public Component getStatusLine() {
 		if (scheduleStack.isEmpty()) {
 			return Component.translatable("simurail.navigation_controller.no_schedule");
@@ -1624,13 +1942,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.lastDistance = Double.NaN;
 		this.currentPath = Collections.emptyList();
 
-		this.cachedStation = null;
-		this.cachedTargetNode = null;
-
 		this.currentStation = null;
 		this.lastStationEdge = null;
-
-		this.needsDirectionCorrection = false;
 
 		this.lastMovingTowardsNode2 = true;
 		this.hasLastMovingDirection = false;
@@ -1639,6 +1952,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.hasDirectionSignBeenSet = false;
 		this.lastSourceSign = 1.0;
 		this.lastForwardSign = 0;
+
+		this.storagePortsActive = false;
 
 		if (level != null) {
 			CompoundTag tag = stack.get(AllDataComponents.TRAIN_SCHEDULE);
@@ -1680,6 +1995,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		tag.putDouble("LastTravelDirX", lastTravelDir.x);
 		tag.putDouble("LastTravelDirY", lastTravelDir.y);
 		tag.putDouble("LastTravelDirZ", lastTravelDir.z);
+
+		tag.putBoolean("StoragePortsActive", storagePortsActive);
 
 		ListTag progressTag = new ListTag();
 		for (int p : conditionProgress) {
@@ -1730,6 +2047,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			lastTravelDir = Vec3.ZERO;
 		}
 
+		storagePortsActive = tag.contains("StoragePortsActive") && tag.getBoolean("StoragePortsActive");
+
 		conditionProgress.clear();
 		for (Tag t : tag.getList("ConditionProgress", Tag.TAG_INT)) {
 			conditionProgress.add(((IntTag) t).getAsInt());
@@ -1742,6 +2061,5 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		currentStation = null;
 		lastStationEdge = null;
-		needsDirectionCorrection = false;
 	}
 }
