@@ -58,6 +58,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private static final double BRAKE_START_DISTANCE = 128.0;
 	private static final double FULL_STOP_DISTANCE = 1.0;
+	private static final double ARRIVAL_HOLD_DISTANCE = 2.0;
 	private static final double MAX_DECELERATION = 0.4;
 
 	private ItemStack scheduleStack = ItemStack.EMPTY;
@@ -90,6 +91,15 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private TrackEdge lastStationEdge = null;
 
 	private boolean needsDirectionCorrection = false;
+
+	private boolean lastMovingTowardsNode2 = true;
+	private boolean hasLastMovingDirection = false;
+
+	private Vec3 lastTravelDir = Vec3.ZERO;
+	private boolean hasDirectionSignBeenSet = false;
+	private double lastSourceSign = 1.0;
+
+	private int lastForwardSign = 0;
 
 	public NavigationControllerBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState state) {
 		super(type, pos, state);
@@ -152,6 +162,53 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		behaviours.add(maxSpeedScroll);
 	}
 
+	private record EdgePathDirection(boolean towardsNode2, int startIdx) {}
+
+	private EdgePathDirection getEdgePathDirection(List<TrackNode> path, TrackEdge edge) {
+		if (path == null || path.isEmpty() || edge == null) {
+			return new EdgePathDirection(false, -1);
+		}
+
+		int idx1 = path.indexOf(edge.node1);
+		int idx2 = path.indexOf(edge.node2);
+
+		if (idx1 == -1 && idx2 == -1) {
+			return new EdgePathDirection(false, -1);
+		}
+
+		int earliestIdx;
+		TrackNode earliestNode;
+		TrackNode otherNode;
+
+		if (idx1 == -1) {
+			earliestIdx = idx2;
+			earliestNode = edge.node2;
+			otherNode = edge.node1;
+		} else if (idx2 == -1) {
+			earliestIdx = idx1;
+			earliestNode = edge.node1;
+			otherNode = edge.node2;
+		} else {
+			if (idx1 <= idx2) {
+				earliestIdx = idx1;
+				earliestNode = edge.node1;
+				otherNode = edge.node2;
+			} else {
+				earliestIdx = idx2;
+				earliestNode = edge.node2;
+				otherNode = edge.node1;
+			}
+
+			if (earliestIdx + 1 < path.size() && path.get(earliestIdx + 1) == otherNode) {
+				boolean towardsNode2 = otherNode == edge.node2;
+				return new EdgePathDirection(towardsNode2, earliestIdx + 1);
+			}
+		}
+
+		boolean towardsNode2 = earliestNode == edge.node2;
+		return new EdgePathDirection(towardsNode2, earliestIdx);
+	}
+
 	private double computeSteerForBogey(PhysicsBogeyBlockEntity bogey, TrackGraph graph,
 										List<TrackNode> path, TrackNode n1, TrackNode n2,
 										boolean movingTowardsNode2, GlobalStation targetStation) {
@@ -161,23 +218,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		TravellingPoint point = axle.getTrackPoint();
 		if (point == null || point.edge == null) return 0.0;
 
-		int idx1 = path.indexOf(point.edge.node1);
-		int idx2 = path.indexOf(point.edge.node2);
+		EdgePathDirection dir = getEdgePathDirection(path, point.edge);
+		if (dir.startIdx() < 0) return 0.0;
 
-		if (idx1 == -1 && idx2 == -1) return 0.0;
-
-		boolean bogeyMovingTowardsNode2 = idx2 > idx1 || (idx1 == -1 && idx2 != -1);
-
-		int startIdx;
-		if (bogeyMovingTowardsNode2) {
-			startIdx = idx2;
-		} else {
-			startIdx = idx1;
-		}
-
-		if (startIdx < 0) {
-			startIdx = Math.max(idx1, idx2);
-		}
+		boolean bogeyMovingTowardsNode2 = dir.towardsNode2();
+		int startIdx = dir.startIdx();
 
 		Vec3 requiredDir = bogeyMovingTowardsNode2
 				? point.edge.node2.getLocation().getLocation()
@@ -224,14 +269,13 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		Set<PhysicsBogeyBlockEntity> consist = traverseConsist(anchorBogey);
 
-		Target target = resolveDestination(serverLevel);
+		Target target = resolveDestination(serverLevel, anchorBogey);
 
 		double targetRPM = (maxSpeedScroll != null) ? Math.min(maxSpeedScroll.getValue(), 256.0) : 32.0;
 
 		double inputSpeed = getSpeed();
 		double absInputSpeed = Math.abs(inputSpeed);
 
-		// Use baseline speed so gearRatio is never 0 when the train is stopped.
 		double baselineSpeed = Math.max(absInputSpeed, 16.0);
 		double gearRatio = targetRPM / baselineSpeed;
 		double maxSafeRatio = 256.0 / baselineSpeed;
@@ -277,31 +321,47 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 					if (Math.abs(trackSpeed) > 0.05) {
 						movingTowardsNode2 = (trackSpeed > 0.0) ^ trackReversed;
+
+						lastMovingTowardsNode2 = movingTowardsNode2;
+						hasLastMovingDirection = true;
 					} else {
-						movingTowardsNode2 = this.directionSign > 0;
+						movingTowardsNode2 = hasLastMovingDirection
+								? lastMovingTowardsNode2
+								: this.directionSign > 0;
 					}
 
 					int directionPreference = 0;
+
 					if (Math.abs(trackSpeed) > 0.05) {
 						directionPreference = ((trackSpeed > 0.0) ^ trackReversed) ? 2 : 1;
+					} else if (hasLastMovingDirection) {
+						directionPreference = lastMovingTowardsNode2 ? 2 : 1;
+					}
+
+					if (directionPreference == 0 && lastTravelDir.lengthSqr() > 0.01) {
+						directionPreference = lastTravelDir.dot(edgeForward) >= 0.0 ? 2 : 1;
+					}
+
+					if (directionPreference == 0) {
+						Vec3 bogeyForward = Vec3.atLowerCornerOf(anchorBogey.getFacing().getNormal());
+						directionPreference = bogeyForward.dot(edgeForward) >= 0.0 ? 2 : 1;
 					}
 
 					TrackEdge targetStationEdge = getStationEdge(graph, target.station);
 
-					// Clear currentStation only when we are no longer on that station's actual edge.
 					if (currentStation != null) {
 						TrackEdge oldStationEdge = getStationEdge(graph, currentStation);
+
 						if (oldStationEdge == null || !sameEdge(point.edge, oldStationEdge)) {
 							currentStation = null;
 							lastStationEdge = null;
 						}
 					}
 
-					boolean onTargetStationEdge = targetStationEdge != null && sameEdge(point.edge, targetStationEdge);
+					boolean onTargetStationEdge = targetStationEdge != null
+							&& sameEdge(point.edge, targetStationEdge)
+							&& (target.station != currentStation || arrivedAtDestination);
 
-					// If we are already on the target station edge, force the path to point toward
-					// the actual station stop. This is especially important for bidirectional stations
-					// and dead-end stations.
 					if (onTargetStationEdge) {
 						double stationPosOnEdge = target.station.getLocationOn(targetStationEdge);
 
@@ -326,7 +386,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 						currentPath = desiredTowardsNode2 ? List.of(n1, n2) : List.of(n2, n1);
 						lastDistance = Double.NaN;
-					} else if (currentPath.isEmpty() || !isCurrentEdgeOnPath(currentPath, point.edge)) {
+					} else if (currentPath.isEmpty() || !isCurrentEdgeOnPath(currentPath, point.edge, movingTowardsNode2)) {
 						currentPath = buildBestStationPath(
 								graph,
 								point,
@@ -336,23 +396,16 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								currentStation,
 								directionPreference
 						);
+
 						lastDistance = Double.NaN;
 					}
 
-					boolean usablePath = !currentPath.isEmpty() && isCurrentEdgeOnPath(currentPath, point.edge);
+					EdgePathDirection currentDir = getEdgePathDirection(currentPath, point.edge);
+					boolean usablePath = !currentPath.isEmpty() && currentDir.startIdx() >= 0;
 
 					if (usablePath) {
-						int idx1 = currentPath.indexOf(n1);
-						int idx2 = currentPath.indexOf(n2);
+						movingTowardsNode2 = currentDir.towardsNode2();
 
-						if (idx1 != -1 && idx2 != -1) {
-							movingTowardsNode2 = idx2 > idx1;
-						} else {
-							movingTowardsNode2 = (idx2 != -1);
-						}
-
-						// If we are on the target station edge, make absolutely sure we are heading
-						// toward the station stop, not away from it.
 						if (onTargetStationEdge) {
 							double stationPosOnEdge = target.station.getLocationOn(targetStationEdge);
 
@@ -374,39 +427,91 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 						movingTowardsNode2ForSteering = movingTowardsNode2;
 
-						int desiredSign = computeDirectionSign(
-								edgeForward,
-								axleForward,
-								movingTowardsNode2,
-								sourceSign
-						);
+						lastMovingTowardsNode2 = movingTowardsNode2;
+						hasLastMovingDirection = true;
 
-						boolean hasActualDirection = Math.abs(trackSpeed) > 0.05;
-						if (hasActualDirection) {
-							boolean actualTowardsNode2 = (trackSpeed > 0.0) ^ trackReversed;
-							if (actualTowardsNode2 != movingTowardsNode2) {
-								mustStopToReverse = true;
+						Vec3 desiredTravelDir = movingTowardsNode2 ? edgeForward : edgeForward.scale(-1);
+
+						boolean sourceChanged = Math.abs(sourceSign - lastSourceSign) > 0.001;
+						if (sourceChanged) {
+							lastForwardSign = 0;
+						}
+
+						if (Math.abs(trackSpeed) > 0.05 && Math.abs(currentSpeedMultiplier) > 0.01) {
+							boolean actualTowardsNode2Now = (trackSpeed > 0.0) ^ trackReversed;
+
+							if (actualTowardsNode2Now == movingTowardsNode2) {
+								lastForwardSign = currentSpeedMultiplier > 0.0 ? 1 : -1;
 							}
 						}
 
-						this.directionSign = desiredSign;
-						this.needsDirectionCorrection = false;
+						int desiredSign;
 
-						int startIdx = movingTowardsNode2 ? idx2 : idx1;
-						if (startIdx < 0) startIdx = Math.max(idx1, idx2);
-						if (startIdx < 0) startIdx = 0;
+						boolean hasPhysicalReference = lastForwardSign != 0 && lastTravelDir.lengthSqr() > 0.01;
 
-						List<TrackNode> remainingPath = currentPath.subList(startIdx, currentPath.size());
+						if (hasPhysicalReference) {
+							double dot = desiredTravelDir.dot(lastTravelDir);
+
+							if (dot > 0.5) {
+								desiredSign = lastForwardSign;
+							} else if (dot < -0.5) {
+								desiredSign = -lastForwardSign;
+							} else {
+								desiredSign = this.directionSign;
+							}
+						} else {
+							desiredSign = computeDirectionSign(
+									edgeForward,
+									axleForward,
+									movingTowardsNode2,
+									sourceSign
+							);
+						}
+
+						boolean actualTowardsNode2 = Math.abs(trackSpeed) > 0.05
+								? ((trackSpeed > 0.0) ^ trackReversed)
+								: movingTowardsNode2;
+
+						boolean wantsPhysicalReverse = actualTowardsNode2 != movingTowardsNode2;
+						boolean wantsSignFlip = desiredSign != this.directionSign;
+
+						if (Math.abs(trackSpeed) > 0.1 && (wantsPhysicalReverse || wantsSignFlip)) {
+							mustStopToReverse = true;
+						} else {
+							if (!hasDirectionSignBeenSet || wantsSignFlip || sourceChanged) {
+								this.directionSign = desiredSign;
+
+								if (Math.abs(trackSpeed) <= 0.1) {
+									lastForwardSign = desiredSign;
+								}
+							}
+
+							lastTravelDir = desiredTravelDir;
+							hasDirectionSignBeenSet = true;
+							lastSourceSign = sourceSign;
+						}
+
+						int startIdx = currentDir.startIdx();
+
+						if (startIdx > 0 && startIdx < currentPath.size()) {
+							currentPath = new ArrayList<>(currentPath.subList(startIdx, currentPath.size()));
+						}
+
+						List<TrackNode> remainingPath = currentPath;
 
 						double distance = calculatePathDistance(
 								graph,
 								remainingPath,
 								point,
 								movingTowardsNode2,
-								target.station
+								target.station,
+								currentStation
 						);
 
-						if (distance < FULL_STOP_DISTANCE) {
+						boolean shouldArrive = distance < FULL_STOP_DISTANCE
+								|| (arrivedAtDestination && distance < ARRIVAL_HOLD_DISTANCE);
+
+						if (shouldArrive) {
 							currentStation = target.station;
 							lastStationEdge = targetStationEdge != null ? targetStationEdge : point.edge;
 
@@ -435,6 +540,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							double speedFraction = Math.clamp(desiredSpeed / maxLinearSpeed, 0.0, 1.0);
 
 							newMultiplier = (float) (speedFraction * gearRatio * this.directionSign);
+
+							if (Math.abs(newMultiplier) < 0.01f) {
+								newMultiplier = 0.0f;
+							}
 
 							if (distance <= brakeStart) {
 								double brakeRamp = (distance - FULL_STOP_DISTANCE)
@@ -478,6 +587,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			brakeStrength = 1.0;
 
 			this.directionSign = 1;
+
+			lastTravelDir = Vec3.ZERO;
+			hasDirectionSignBeenSet = false;
+			lastSourceSign = 1.0;
+			lastForwardSign = 0;
 		}
 
 		PhysicsBogeyBlockEntity frontBogey = null;
@@ -600,8 +714,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 					return d1 > d2 ? n1 : n2;
 				}
 
-				// canApproachFrom(n2) -> train heads towards n2, must arrive at n1 first.
-				// canApproachFrom(n1) -> train heads towards n1, must arrive at n2 first.
 				if (station.canApproachFrom(n2)) return n1;
 				if (station.canApproachFrom(n1)) return n2;
 
@@ -629,7 +741,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return nearest;
 	}
 
-	private List<TrackNode> findPath(TrackGraph graph, TrackNode startNode, TrackNode targetNode) {
+	private List<TrackNode> findPath(TrackGraph graph, TrackNode startNode, TrackNode targetNode,
+									 @Nullable TrackNode disallowFirstNode) {
 		if (startNode == targetNode) return List.of(startNode);
 
 		Map<TrackNode, TrackNode> cameFrom = new HashMap<>();
@@ -637,6 +750,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		queue.add(startNode);
 		cameFrom.put(startNode, null);
+
+		if (disallowFirstNode != null && disallowFirstNode != targetNode && disallowFirstNode != startNode) {
+			cameFrom.put(disallowFirstNode, startNode);
+		}
 
 		while (!queue.isEmpty()) {
 			TrackNode current = queue.poll();
@@ -679,7 +796,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	}
 
 	private List<TrackNode> findPathAvoidingEdge(TrackGraph graph, TrackNode startNode, TrackNode targetNode,
-												 TrackNode avoidA, TrackNode avoidB) {
+												 TrackNode avoidA, TrackNode avoidB,
+												 @Nullable TrackNode disallowFirstNode) {
 		if (startNode == targetNode) return List.of(startNode);
 
 		Map<TrackNode, TrackNode> cameFrom = new HashMap<>();
@@ -687,6 +805,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		queue.add(startNode);
 		cameFrom.put(startNode, null);
+
+		if (disallowFirstNode != null && disallowFirstNode != targetNode && disallowFirstNode != startNode) {
+			cameFrom.put(disallowFirstNode, startNode);
+		}
 
 		while (!queue.isEmpty()) {
 			TrackNode current = queue.poll();
@@ -733,7 +855,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	}
 
 	private double calculatePathDistance(TrackGraph graph, List<TrackNode> path, TravellingPoint start,
-										 boolean movingTowardsNode2, @Nullable GlobalStation targetStation) {
+										 boolean movingTowardsNode2,
+										 @Nullable GlobalStation targetStation,
+										 @Nullable GlobalStation currentStation) {
 		if (path.isEmpty() || start.edge == null) return 0;
 
 		TrackEdge stationEdge = null;
@@ -747,9 +871,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 		}
 
-		// If we are already on the target station edge, distance is simply the distance
-		// along that edge to the station stop.
-		if (stationEdge != null && sameEdge(start.edge, stationEdge)) {
+		boolean suppressStationEdgeArrival = targetStation != null
+				&& targetStation == currentStation
+				&& !arrivedAtDestination;
+
+		if (stationEdge != null && sameEdge(start.edge, stationEdge) && !suppressStationEdgeArrival) {
 			double startPos = start.position;
 
 			if (start.edge.node1 != stationEdge.node1) {
@@ -771,7 +897,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 					? edge.getLength()
 					: p1.getLocation().getLocation().distanceTo(p2.getLocation().getLocation());
 
-			// If the final edge is the target station edge, only count distance up to the station.
 			if (i == path.size() - 2 && stationEdge != null && sameEdge(edge, stationEdge)) {
 				if (p1 == stationEdge.node1) {
 					edgeLength = stationPosOnEdge;
@@ -783,8 +908,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			distance += edgeLength;
 		}
 
-		// If the path ends at one end of the station edge but does not include the station edge itself,
-		// add the remaining distance from that end to the actual station stop.
 		if (stationEdge != null && !path.isEmpty()) {
 			boolean lastEdgeIsStationEdge = false;
 
@@ -941,8 +1064,15 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			TrackNode depart
 	) {}
 
+	private record Candidate(
+			boolean valid,
+			boolean matchesDirection,
+			double score,
+			List<TrackNode> path
+	) {}
+
 	@Nullable
-	private Target resolveDestination(ServerLevel level) {
+	private Target resolveDestination(ServerLevel level, PhysicsBogeyBlockEntity anchorBogey) {
 		if (scheduleStack.isEmpty()) return null;
 
 		CompoundTag scheduleTag = scheduleStack.get(AllDataComponents.TRAIN_SCHEDULE);
@@ -960,12 +1090,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			return null;
 		}
 
-		GlobalStation station = findMatchingStation(level, destination);
+		BlockPos referencePos = anchorBogey != null ? anchorBogey.getBlockPos() : worldPosition;
+
+		GlobalStation station = findMatchingStation(level, destination, referencePos);
 		return station == null ? null : new Target(schedule, entry, destination, station);
 	}
 
 	@Nullable
-	private GlobalStation findMatchingStation(ServerLevel level, DestinationInstruction destination) {
+	private GlobalStation findMatchingStation(ServerLevel level, DestinationInstruction destination, BlockPos referencePos) {
 		lastMatchedStationName = null;
 
 		String filter = destination.getFilterForRegex();
@@ -1003,7 +1135,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 				if (!exactMatch && !containsMatch) continue;
 
-				double distSq = station.getBlockEntityPos().distSqr(getBlockPos());
+				double distSq = station.getBlockEntityPos().distSqr(referencePos);
 
 				if (exactMatch) {
 					if (distSq < exactNearestDistSq) {
@@ -1077,7 +1209,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		resetConditionProgress();
 
 		lastDistance = Double.NaN;
-		directionSign = 1;
 
 		currentPath = Collections.emptyList();
 
@@ -1131,7 +1262,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	@Nullable
 	private TrackEdge getStationEdge(TrackGraph graph, GlobalStation station) {
-		if (station.edgeLocation == null) return null;
+		if (station == null || station.edgeLocation == null) return null;
 
 		TrackNode n1 = graph.locateNode(station.edgeLocation.getFirst());
 		TrackNode n2 = graph.locateNode(station.edgeLocation.getSecond());
@@ -1154,17 +1285,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		boolean canApproachTowardsN1 = station.canApproachFrom(n1);
 		boolean canApproachTowardsN2 = station.canApproachFrom(n2);
 
-		// canApproachFrom(n2) means the train heads towards n2, so approach node is n1.
 		if (canApproachTowardsN2) {
 			approaches.add(new StationApproach(n1, n2));
 		}
 
-		// canApproachFrom(n1) means the train heads towards n1, so approach node is n2.
 		if (canApproachTowardsN1) {
 			approaches.add(new StationApproach(n2, n1));
 		}
 
-		// Fallback for assembling stations or unusual station states.
 		if (approaches.isEmpty() || station.assembling) {
 			boolean hasN1ToN2 = false;
 			boolean hasN2ToN1 = false;
@@ -1190,17 +1318,13 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			return path;
 		}
 
-		if (path.contains(depart)) {
-			return path;
-		}
-
 		List<TrackNode> out = new ArrayList<>(path);
 		out.add(depart);
 
 		return out;
 	}
 
-	private boolean isCurrentEdgeOnPath(List<TrackNode> path, TrackEdge edge) {
+	private boolean isCurrentEdgeOnPath(List<TrackNode> path, TrackEdge edge, boolean desiredTowardsNode2) {
 		if (path.isEmpty() || edge == null) return false;
 
 		int idx1 = path.indexOf(edge.node1);
@@ -1209,14 +1333,16 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		if (idx1 == -1 && idx2 == -1) return false;
 
 		if (idx1 != -1 && idx2 != -1) {
-			return Math.abs(idx1 - idx2) == 1;
+			return true;
 		}
 
-		int idx = idx1 != -1 ? idx1 : idx2;
+		TrackNode approachedNode = desiredTowardsNode2 ? edge.node2 : edge.node1;
 
-		// Allow a single-node path boundary. This is useful when the train is on a station edge
-		// and the path starts at the node it needs to move toward.
-		return idx == 0 || idx == path.size() - 1;
+		if (idx1 != -1) {
+			return edge.node1 == approachedNode;
+		}
+
+		return edge.node2 == approachedNode;
 	}
 
 	private int computeDirectionSign(Vec3 edgeForward, Vec3 axleForward, boolean movingTowardsNode2, double sourceSign) {
@@ -1230,6 +1356,214 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return desiredBogeyRotation * src;
 	}
 
+	private Candidate evaluatePathCandidate(TrackGraph graph, TravellingPoint point,
+											List<TrackNode> path,
+											GlobalStation targetStation,
+											@Nullable GlobalStation currentStation,
+											int directionPreference) {
+		if (path.isEmpty()) {
+			return new Candidate(false, false, Double.MAX_VALUE, path);
+		}
+
+		EdgePathDirection dir = getEdgePathDirection(path, point.edge);
+		if (dir.startIdx() < 0) {
+			return new Candidate(false, false, Double.MAX_VALUE, path);
+		}
+
+		boolean towardsNode2 = dir.towardsNode2();
+
+		boolean matchesDirection = directionPreference == 0
+				|| (directionPreference == 1 ? !towardsNode2 : towardsNode2);
+
+		boolean valid = pathRespectsAllStationDirections(
+				graph,
+				path,
+				point,
+				towardsNode2,
+				targetStation,
+				currentStation
+		);
+
+		List<TrackNode> scoringPath = path;
+		if (dir.startIdx() > 0 && dir.startIdx() < path.size()) {
+			scoringPath = path.subList(dir.startIdx(), path.size());
+		}
+
+		double score = calculatePathDistance(
+				graph,
+				scoringPath,
+				point,
+				towardsNode2,
+				targetStation,
+				currentStation
+		);
+
+		if (directionPreference == 1) {
+			if (towardsNode2) {
+				score += 100000.0;
+			} else {
+				score *= 0.9;
+			}
+		} else if (directionPreference == 2) {
+			if (!towardsNode2) {
+				score += 100000.0;
+			} else {
+				score *= 0.9;
+			}
+		}
+
+		if (targetStation != null && targetStation == currentStation && !arrivedAtDestination) {
+			if (path.size() <= 3 || scoringPath.size() <= 2) {
+				score += 1000000.0;
+			}
+		}
+
+		return new Candidate(valid, matchesDirection, score, path);
+	}
+
+	private boolean acceptCandidate(Candidate candidate, boolean requireDirection, boolean requireValid) {
+		if (candidate.path().isEmpty()) return false;
+		if (candidate.score() >= Double.MAX_VALUE) return false;
+		if (requireDirection && !candidate.matchesDirection()) return false;
+		if (requireValid && !candidate.valid()) return false;
+		return true;
+	}
+
+	private List<TrackNode> tryBuildBestStationPath(TrackGraph graph, TravellingPoint point,
+													TrackNode n1, TrackNode n2,
+													GlobalStation targetStation,
+													@Nullable GlobalStation currentStation,
+													int directionPreference,
+													List<StationApproach> approaches,
+													boolean requireDirection,
+													boolean requireValid) {
+		List<TrackNode> bestPath = Collections.emptyList();
+		double bestScore = Double.MAX_VALUE;
+
+		TrackNode path1Disallow = (requireDirection && directionPreference == 1) ? n2 : null;
+		TrackNode path2Disallow = (requireDirection && directionPreference == 2) ? n1 : null;
+
+		if (!approaches.isEmpty()) {
+			for (StationApproach approach : approaches) {
+				List<TrackNode> path1 = withStationEdge(
+						findPathAvoidingEdge(
+								graph,
+								n1,
+								approach.approach,
+								approach.approach,
+								approach.depart,
+								path1Disallow
+						),
+						approach.approach,
+						approach.depart
+				);
+
+				List<TrackNode> path2 = withStationEdge(
+						findPathAvoidingEdge(
+								graph,
+								n2,
+								approach.approach,
+								approach.approach,
+								approach.depart,
+								path2Disallow
+						),
+						approach.approach,
+						approach.depart
+				);
+
+				if (path1.isEmpty() && path2.isEmpty()) {
+					path1 = withStationEdge(
+							findPath(
+									graph,
+									n1,
+									approach.approach,
+									path1Disallow
+							),
+							approach.approach,
+							approach.depart
+					);
+
+					path2 = withStationEdge(
+							findPath(
+									graph,
+									n2,
+									approach.approach,
+									path2Disallow
+							),
+							approach.approach,
+							approach.depart
+					);
+				}
+
+				Candidate c1 = evaluatePathCandidate(
+						graph,
+						point,
+						path1,
+						targetStation,
+						currentStation,
+						directionPreference
+				);
+
+				if (acceptCandidate(c1, requireDirection, requireValid) && c1.score() < bestScore) {
+					bestScore = c1.score();
+					bestPath = c1.path();
+				}
+
+				Candidate c2 = evaluatePathCandidate(
+						graph,
+						point,
+						path2,
+						targetStation,
+						currentStation,
+						directionPreference
+				);
+
+				if (acceptCandidate(c2, requireDirection, requireValid) && c2.score() < bestScore) {
+					bestScore = c2.score();
+					bestPath = c2.path();
+				}
+			}
+
+			return bestPath;
+		}
+
+		TrackNode targetNode = findNearestNodeToStation(graph, targetStation);
+		if (targetNode == null) return bestPath;
+
+		List<TrackNode> path1 = findPath(graph, n1, targetNode, path1Disallow);
+		List<TrackNode> path2 = findPath(graph, n2, targetNode, path2Disallow);
+
+		Candidate c1 = evaluatePathCandidate(
+				graph,
+				point,
+				path1,
+				targetStation,
+				currentStation,
+				directionPreference
+		);
+
+		if (acceptCandidate(c1, requireDirection, requireValid) && c1.score() < bestScore) {
+			bestScore = c1.score();
+			bestPath = c1.path();
+		}
+
+		Candidate c2 = evaluatePathCandidate(
+				graph,
+				point,
+				path2,
+				targetStation,
+				currentStation,
+				directionPreference
+		);
+
+		if (acceptCandidate(c2, requireDirection, requireValid) && c2.score() < bestScore) {
+			bestScore = c2.score();
+			bestPath = c2.path();
+		}
+
+		return bestPath;
+	}
+
 	private List<TrackNode> buildBestStationPath(TrackGraph graph, TravellingPoint point,
 												 TrackNode n1, TrackNode n2,
 												 GlobalStation targetStation,
@@ -1237,197 +1571,30 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 												 int directionPreference) {
 		List<StationApproach> approaches = getStationApproaches(graph, targetStation);
 
-		List<TrackNode> bestValidPath = Collections.emptyList();
-		double bestValidScore = Double.MAX_VALUE;
+		List<TrackNode> result;
 
-		List<TrackNode> bestInvalidPath = Collections.emptyList();
-		double bestInvalidScore = Double.MAX_VALUE;
+		result = tryBuildBestStationPath(
+				graph, point, n1, n2, targetStation, currentStation,
+				directionPreference, approaches, true, true
+		);
+		if (!result.isEmpty()) return result;
 
-		if (!approaches.isEmpty()) {
-			for (StationApproach approach : approaches) {
-				List<TrackNode> path1 = withStationEdge(
-						findPathAvoidingEdge(graph, n1, approach.approach, approach.approach, approach.depart),
-						approach.approach,
-						approach.depart
-				);
+		result = tryBuildBestStationPath(
+				graph, point, n1, n2, targetStation, currentStation,
+				directionPreference, approaches, false, true
+		);
+		if (!result.isEmpty()) return result;
 
-				List<TrackNode> path2 = withStationEdge(
-						findPathAvoidingEdge(graph, n2, approach.approach, approach.approach, approach.depart),
-						approach.approach,
-						approach.depart
-				);
+		result = tryBuildBestStationPath(
+				graph, point, n1, n2, targetStation, currentStation,
+				directionPreference, approaches, true, false
+		);
+		if (!result.isEmpty()) return result;
 
-				if (path1.isEmpty() && path2.isEmpty()) {
-					path1 = withStationEdge(
-							findPath(graph, n1, approach.approach),
-							approach.approach,
-							approach.depart
-					);
-
-					path2 = withStationEdge(
-							findPath(graph, n2, approach.approach),
-							approach.approach,
-							approach.depart
-					);
-				}
-
-				if (!path1.isEmpty()) {
-					boolean valid = pathRespectsAllStationDirections(
-							graph,
-							path1,
-							point,
-							false,
-							targetStation,
-							currentStation
-					);
-
-					double score = calculatePathDistance(
-							graph,
-							path1,
-							point,
-							false,
-							targetStation
-					);
-
-					if (directionPreference == 1) {
-						score *= 0.9;
-					}
-
-					if (valid) {
-						if (score < bestValidScore) {
-							bestValidScore = score;
-							bestValidPath = path1;
-						}
-					} else {
-						if (score < bestInvalidScore) {
-							bestInvalidScore = score;
-							bestInvalidPath = path1;
-						}
-					}
-				}
-
-				if (!path2.isEmpty()) {
-					boolean valid = pathRespectsAllStationDirections(
-							graph,
-							path2,
-							point,
-							true,
-							targetStation,
-							currentStation
-					);
-
-					double score = calculatePathDistance(
-							graph,
-							path2,
-							point,
-							true,
-							targetStation
-					);
-
-					if (directionPreference == 2) {
-						score *= 0.9;
-					}
-
-					if (valid) {
-						if (score < bestValidScore) {
-							bestValidScore = score;
-							bestValidPath = path2;
-						}
-					} else {
-						if (score < bestInvalidScore) {
-							bestInvalidScore = score;
-							bestInvalidPath = path2;
-						}
-					}
-				}
-			}
-
-			if (!bestValidPath.isEmpty()) return bestValidPath;
-			if (!bestInvalidPath.isEmpty()) return bestInvalidPath;
-
-			return Collections.emptyList();
-		}
-
-		TrackNode targetNode = findNearestNodeToStation(graph, targetStation);
-		if (targetNode == null) return Collections.emptyList();
-
-		List<TrackNode> path1 = findPath(graph, n1, targetNode);
-		List<TrackNode> path2 = findPath(graph, n2, targetNode);
-
-		if (!path1.isEmpty()) {
-			boolean valid = pathRespectsAllStationDirections(
-					graph,
-					path1,
-					point,
-					false,
-					targetStation,
-					currentStation
-			);
-
-			double score = calculatePathDistance(
-					graph,
-					path1,
-					point,
-					false,
-					targetStation
-			);
-
-			if (directionPreference == 1) {
-				score *= 0.9;
-			}
-
-			if (valid) {
-				if (score < bestValidScore) {
-					bestValidScore = score;
-					bestValidPath = path1;
-				}
-			} else {
-				if (score < bestInvalidScore) {
-					bestInvalidScore = score;
-					bestInvalidPath = path1;
-				}
-			}
-		}
-
-		if (!path2.isEmpty()) {
-			boolean valid = pathRespectsAllStationDirections(
-					graph,
-					path2,
-					point,
-					true,
-					targetStation,
-					currentStation
-			);
-
-			double score = calculatePathDistance(
-					graph,
-					path2,
-					point,
-					true,
-					targetStation
-			);
-
-			if (directionPreference == 2) {
-				score *= 0.9;
-			}
-
-			if (valid) {
-				if (score < bestValidScore) {
-					bestValidScore = score;
-					bestValidPath = path2;
-				}
-			} else {
-				if (score < bestInvalidScore) {
-					bestInvalidScore = score;
-					bestInvalidPath = path2;
-				}
-			}
-		}
-
-		if (!bestValidPath.isEmpty()) return bestValidPath;
-		if (!bestInvalidPath.isEmpty()) return bestInvalidPath;
-
-		return Collections.emptyList();
+		return tryBuildBestStationPath(
+				graph, point, n1, n2, targetStation, currentStation,
+				directionPreference, approaches, false, false
+		);
 	}
 
 	public Component getStatusLine() {
@@ -1465,6 +1632,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		this.needsDirectionCorrection = false;
 
+		this.lastMovingTowardsNode2 = true;
+		this.hasLastMovingDirection = false;
+
+		this.lastTravelDir = Vec3.ZERO;
+		this.hasDirectionSignBeenSet = false;
+		this.lastSourceSign = 1.0;
+		this.lastForwardSign = 0;
+
 		if (level != null) {
 			CompoundTag tag = stack.get(AllDataComponents.TRAIN_SCHEDULE);
 			Schedule schedule = tag != null ? Schedule.fromTag(level.registryAccess(), tag) : new Schedule();
@@ -1495,6 +1670,17 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		tag.putFloat("Multiplier", currentSpeedMultiplier);
 		tag.putInt("DirectionSign", directionSign);
 
+		tag.putBoolean("LastMovingTowardsNode2", lastMovingTowardsNode2);
+		tag.putBoolean("HasLastMovingDirection", hasLastMovingDirection);
+
+		tag.putBoolean("HasDirectionSignBeenSet", hasDirectionSignBeenSet);
+		tag.putDouble("LastSourceSign", lastSourceSign);
+		tag.putInt("LastForwardSign", lastForwardSign);
+
+		tag.putDouble("LastTravelDirX", lastTravelDir.x);
+		tag.putDouble("LastTravelDirY", lastTravelDir.y);
+		tag.putDouble("LastTravelDirZ", lastTravelDir.z);
+
 		ListTag progressTag = new ListTag();
 		for (int p : conditionProgress) {
 			progressTag.add(IntTag.valueOf(p));
@@ -1521,6 +1707,28 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		currentSpeedMultiplier = tag.getFloat("Multiplier");
 
 		directionSign = tag.contains("DirectionSign") ? tag.getInt("DirectionSign") : 1;
+
+		if (tag.contains("HasLastMovingDirection")) {
+			hasLastMovingDirection = tag.getBoolean("HasLastMovingDirection");
+			lastMovingTowardsNode2 = !tag.contains("LastMovingTowardsNode2") || tag.getBoolean("LastMovingTowardsNode2");
+		} else {
+			hasLastMovingDirection = false;
+			lastMovingTowardsNode2 = true;
+		}
+
+		hasDirectionSignBeenSet = tag.contains("HasDirectionSignBeenSet") && tag.getBoolean("HasDirectionSignBeenSet");
+		lastSourceSign = tag.contains("LastSourceSign") ? tag.getDouble("LastSourceSign") : 1.0;
+		lastForwardSign = tag.contains("LastForwardSign") ? tag.getInt("LastForwardSign") : 0;
+
+		if (tag.contains("LastTravelDirX")) {
+			lastTravelDir = new Vec3(
+					tag.getDouble("LastTravelDirX"),
+					tag.getDouble("LastTravelDirY"),
+					tag.getDouble("LastTravelDirZ")
+			);
+		} else {
+			lastTravelDir = Vec3.ZERO;
+		}
 
 		conditionProgress.clear();
 		for (Tag t : tag.getList("ConditionProgress", Tag.TAG_INT)) {
