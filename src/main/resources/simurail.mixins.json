@@ -13,6 +13,8 @@
 		"TrackBlockMixin",
 		"TrackBlockEntityMixin",
 		"TrackObserverMixin",
+		"StationBlockEntityMixin",
+		"StationBlockMixin",
 
 		"compat.electroenergetics.AutomaticCouplerBlockMixin",
 		"compat.electroenergetics.PhysicsBogeyBlockMixin",

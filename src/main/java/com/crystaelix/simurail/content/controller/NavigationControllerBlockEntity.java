@@ -39,12 +39,11 @@ import com.simibubi.create.foundation.blockEntity.behaviour.scrollValue.ScrollVa
 import com.simibubi.create.foundation.blockEntity.behaviour.ValueBoxTransform;
 
 import dev.simulated_team.simulated.content.blocks.docking_connector.DockingConnectorBlockEntity;
-
 import net.minecraft.world.phys.Vec3;
-
 import java.util.List;
-
 import net.createmod.catnip.data.Couple;
+
+import com.crystaelix.simurail.api.controller.ICustomStationPresence;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -113,6 +112,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private final Set<ConnectorRef> activatedDockingConnectors = new HashSet<>();
 
 	private record ConnectorRef(ServerLevel level, BlockPos pos) {}
+
+	@Nullable
+	private BlockPos customStationPos = null;
 
 	public NavigationControllerBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState state) {
 		super(type, pos, state);
@@ -711,6 +713,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		setSpeedMultiplier(newMultiplier);
 
+		if (level instanceof ServerLevel sl) {
+			updateCustomStationPresence(sl, currentStation);
+		}
+
 		if (level != null && !level.isClientSide()) {
 			level.updateNeighborsAt(worldPosition, getBlockState().getBlock());
 		}
@@ -1210,6 +1216,29 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		connectorLevel.sendBlockUpdated(pos, state, connectorLevel.getBlockState(pos), 3);
 		connectorLevel.updateNeighborsAt(pos, state.getBlock());
+	}
+
+	private void updateCustomStationPresence(ServerLevel level, @Nullable GlobalStation station) {
+		BlockPos newPos = station != null ? station.getBlockEntityPos() : null;
+
+		if (java.util.Objects.equals(customStationPos, newPos)) {
+			return;
+		}
+
+		if (customStationPos != null) {
+			if (level.getBlockEntity(customStationPos) instanceof ICustomStationPresence presence) {
+				presence.simurail$setCustomTrain(false);
+			}
+
+			customStationPos = null;
+		}
+
+		if (newPos != null) {
+			if (level.getBlockEntity(newPos) instanceof ICustomStationPresence presence) {
+				presence.simurail$setCustomTrain(true);
+				customStationPos = newPos;
+			}
+		}
 	}
 
 	private record Target(
@@ -2041,10 +2070,23 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			this.currentEntry = 0;
 		}
 
+		if (level instanceof ServerLevel sl) {
+			updateCustomStationPresence(sl, null);
+		}
+
 		resetConditionProgress();
 
 		setChanged();
 		sendData();
+	}
+
+	@Override
+	public void remove() {
+		if (level instanceof ServerLevel sl) {
+			updateCustomStationPresence(sl, null);
+		}
+
+		super.remove();
 	}
 
 	@Override
