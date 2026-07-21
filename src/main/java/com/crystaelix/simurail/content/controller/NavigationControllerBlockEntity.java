@@ -1,6 +1,10 @@
 package com.crystaelix.simurail.content.controller;
 
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -8,14 +12,37 @@ import java.util.regex.PatternSyntaxException;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.phys.Vec3;
+
+import net.neoforged.neoforge.capabilities.Capabilities;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler;
+import net.neoforged.neoforge.items.IItemHandler;
+
+import net.createmod.catnip.data.Couple;
 
 import org.jetbrains.annotations.Nullable;
 
+import com.crystaelix.simurail.api.controller.ICustomStationPresence;
 import com.crystaelix.simurail.content.bogey.PhysicsBogeyAxle;
 import com.crystaelix.simurail.content.bogey.PhysicsBogeyBlockEntity;
 
@@ -31,7 +58,9 @@ import com.simibubi.create.content.trains.graph.TrackNode;
 import com.simibubi.create.content.trains.schedule.Schedule;
 import com.simibubi.create.content.trains.schedule.ScheduleEntry;
 import com.simibubi.create.content.trains.schedule.condition.*;
+import com.simibubi.create.content.logistics.filter.FilterItemStack;
 import com.simibubi.create.content.trains.schedule.destination.DestinationInstruction;
+import com.simibubi.create.content.logistics.vault.ItemVaultBlockEntity;
 import com.simibubi.create.content.trains.station.GlobalStation;
 
 import com.simibubi.create.foundation.blockEntity.behaviour.BlockEntityBehaviour;
@@ -39,31 +68,32 @@ import com.simibubi.create.foundation.blockEntity.behaviour.scrollValue.ScrollVa
 import com.simibubi.create.foundation.blockEntity.behaviour.ValueBoxTransform;
 
 import dev.simulated_team.simulated.content.blocks.docking_connector.DockingConnectorBlockEntity;
-import net.minecraft.world.phys.Vec3;
-import java.util.List;
-import net.createmod.catnip.data.Couple;
-
-import com.crystaelix.simurail.api.controller.ICustomStationPresence;
-
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.core.HolderLookup;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.IntTag;
-import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.Tag;
-import net.minecraft.network.chat.Component;
-import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.block.entity.BlockEntityType;
 
 public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private static final int EVALUATE_INTERVAL = 5;
+
 	private static final double BRAKE_START_DISTANCE = 128.0;
-	private static final double FULL_STOP_DISTANCE = 1.0;
-	private static final double ARRIVAL_HOLD_DISTANCE = 2.0;
+	private static final double FULL_STOP_DISTANCE = 0.35;
+	private static final double ARRIVAL_HOLD_DISTANCE = 1.0;
 	private static final double MAX_DECELERATION = 0.4;
+
+	private static final int SUBLEVEL_SCAN_DEPTH = 8;
+	private static final int MAX_OBJECT_GRAPH_DEPTH = 8;
+	private static final int DOCKING_CONNECTOR_SCAN_RADIUS = 12;
+	private static final double DOCKING_CONNECTOR_MAX_PAIR_DISTANCE = 4.5;
+	private static final double DOCKING_CONNECTOR_MAX_PAIR_DISTANCE_SQ = DOCKING_CONNECTOR_MAX_PAIR_DISTANCE * DOCKING_CONNECTOR_MAX_PAIR_DISTANCE;
+	private static final double DOCKING_CONNECTOR_MIN_CENTER_DISTANCE_SQ = 1.5 * 1.5;
+
+	private static final Direction[] CAPABILITY_SIDES = new Direction[]{
+			null,
+			Direction.DOWN,
+			Direction.UP,
+			Direction.NORTH,
+			Direction.SOUTH,
+			Direction.WEST,
+			Direction.EAST
+	};
 
 	private ItemStack scheduleStack = ItemStack.EMPTY;
 
@@ -72,8 +102,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private boolean arrivedAtDestination = false;
 
-	private List<Integer> conditionProgress = new ArrayList<>();
-	private List<CompoundTag> conditionContext = new ArrayList<>();
+	private final List<Integer> conditionProgress = new ArrayList<>();
+	private final List<CompoundTag> conditionContext = new ArrayList<>();
 
 	private float currentSpeedMultiplier = 0.0f;
 	private int directionSign = 1;
@@ -98,6 +128,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private boolean hasDirectionSignBeenSet = false;
 	private double lastSourceSign = 1.0;
 	private int lastForwardSign = 0;
+
+	private String debugInfo = "";
+
 	@Nullable
 	private Target currentTarget = null;
 
@@ -110,8 +143,23 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private boolean dockingConnectorsActive = false;
 	private final Set<ConnectorRef> activatedDockingConnectors = new HashSet<>();
+	private final Set<DockingPairRef> activeDockingPairs = new HashSet<>();
+
+	private static final int DEPARTURE_HOLD_TICKS = 60;
+	private static final float ACCEL_BASE = 0.25f;
+	private static final float ACCEL_SCALE = 0.25f;
+	private int departureHoldTicks = 0;
 
 	private record ConnectorRef(ServerLevel level, BlockPos pos) {}
+	private record DockingPairRef(BlockPos a, BlockPos b) {
+		static DockingPairRef of(BlockPos a, BlockPos b) {
+			return Long.compareUnsigned(a.asLong(), b.asLong()) <= 0
+					? new DockingPairRef(a, b)
+					: new DockingPairRef(b, a);
+		}
+	}
+
+	private record DockingCandidate(DockingConnectorBlockEntity a, DockingConnectorBlockEntity b, double distSq) {}
 
 	@Nullable
 	private BlockPos customStationPos = null;
@@ -269,6 +317,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		if (level == null || level.isClientSide()) return;
 
+		if (departureHoldTicks > 0) {
+			departureHoldTicks--;
+		}
+
 		if (arrivedAtDestination && currentTarget != null && level instanceof ServerLevel serverLevel) {
 			tickArrivalConditions(serverLevel);
 		}
@@ -286,17 +338,21 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		PhysicsBogeyBlockEntity anchorBogey = findAdjacentBogey();
 		if (anchorBogey == null) return;
 
+		Set<PhysicsBogeyBlockEntity> consist = traverseConsist(anchorBogey);
+
 		if (cachedTrain == null || level.getGameTime() % 20 == 0) {
 			cachedTrain = findTrain(level, currentTarget.station, anchorBogey);
 		}
 
-		if (tickConditionsOnce(level, currentTarget.entry, cachedTrain, currentTarget.station)) {
+		if (tickConditionsOnce(level, currentTarget.entry, cachedTrain, currentTarget.station, consist)) {
 			advanceEntry(currentTarget.schedule, level.registryAccess());
 			deactivateDockingConnectors(level);
+			setStoragePortsActive(level, consist, currentTarget.station, false);
 		}
 	}
 
-	private boolean tickConditionsOnce(ServerLevel level, ScheduleEntry entry, @Nullable Train train, GlobalStation station) {
+	private boolean tickConditionsOnce(ServerLevel level, ScheduleEntry entry, @Nullable Train train,
+									   GlobalStation station, Set<PhysicsBogeyBlockEntity> consist) {
 		long gameTime = level.getGameTime();
 
 		if (gameTime == lastConditionTickTime) {
@@ -305,7 +361,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		lastConditionTickTime = gameTime;
 
-		return tickConditions(level, entry, train, station);
+		return tickConditions(level, entry, train, station, consist);
 	}
 
 	private void evaluateAndDrive() {
@@ -315,13 +371,24 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		if (anchorBogey == null) {
 			clearOverridesOnConsist();
 			setSpeedMultiplier(0.0f);
+
+			currentTarget = null;
+			cachedTrain = null;
+			debugInfo = "No bogey found";
+			departureHoldTicks = 0;
+
+			if (level instanceof ServerLevel sl) {
+				deactivateDockingConnectors(sl);
+				setStoragePortsActive(sl, Collections.<PhysicsBogeyBlockEntity>emptySet(), null, false);
+				updateCustomStationPresence(sl, null);
+			}
+
 			return;
 		}
 
 		Set<PhysicsBogeyBlockEntity> consist = traverseConsist(anchorBogey);
 
 		Target target = resolveDestination(serverLevel, anchorBogey);
-
 		currentTarget = target;
 
 		if (target == null) {
@@ -342,8 +409,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		float newMultiplier = 0.0f;
 
 		boolean hasValidPath = false;
-		boolean stationHoldActive = false;
-
+		PhysicsBogeyBlockEntity frontBogey = null;
+		double frontStopOffset = 0.0;
 		TrackGraph graph = null;
 
 		List<TrackNode> pathForSteering = currentPath;
@@ -489,6 +556,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 						Vec3 desiredTravelDir = movingTowardsNode2 ? edgeForward : edgeForward.scale(-1);
 
+						frontBogey = selectFrontBogey(consist, desiredTravelDir);
+						frontStopOffset = computeFrontStopOffset(anchorBogey, frontBogey, desiredTravelDir);
+
 						boolean sourceChanged = Math.abs(sourceSign - lastSourceSign) > 0.001;
 						if (sourceChanged) {
 							lastForwardSign = 0;
@@ -565,8 +635,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								currentStation
 						);
 
-						boolean shouldArrive = distance < FULL_STOP_DISTANCE
-								|| (arrivedAtDestination && distance < ARRIVAL_HOLD_DISTANCE);
+						double stopThreshold = frontStopOffset + FULL_STOP_DISTANCE;
+						double holdThreshold = frontStopOffset + ARRIVAL_HOLD_DISTANCE;
+
+						boolean shouldArrive = distance <= stopThreshold
+								|| (arrivedAtDestination && distance <= holdThreshold);
 
 						if (shouldArrive) {
 							currentStation = target.station;
@@ -576,7 +649,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 							cachedTrain = findTrain(serverLevel, target.station, anchorBogey);
 
-							if (tickConditionsOnce(serverLevel, target.entry, cachedTrain, target.station)) {
+							if (tickConditionsOnce(serverLevel, target.entry, cachedTrain, target.station, consist)) {
 								advanceEntry(target.schedule, level.registryAccess());
 								deactivateDockingConnectors(serverLevel);
 								setStoragePortsActive(serverLevel, consist, target.station, false);
@@ -587,13 +660,16 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 						} else {
 							arrivedAtDestination = false;
 							resetConditionProgress();
+							debugInfo = "";
+
+							double effectiveDistance = Math.max(0.0, distance - frontStopOffset);
 
 							double currentSpeed = Math.abs(anchorBogey.getMovementSpeed());
 							double stoppingDistance = (currentSpeed * currentSpeed) / (2.0 * MAX_DECELERATION);
 							double brakeStart = Math.min(stoppingDistance + FULL_STOP_DISTANCE, BRAKE_START_DISTANCE);
 
 							double maxLinearSpeed = targetRPM / 16.0;
-							double safeSpeed = Math.sqrt(2.0 * MAX_DECELERATION * Math.max(0.0, distance - FULL_STOP_DISTANCE));
+							double safeSpeed = Math.sqrt(2.0 * MAX_DECELERATION * Math.max(0.0, effectiveDistance - FULL_STOP_DISTANCE));
 							double desiredSpeed = Math.min(maxLinearSpeed, safeSpeed);
 
 							double speedFraction = Math.clamp(desiredSpeed / maxLinearSpeed, 0.0, 1.0);
@@ -604,8 +680,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 								newMultiplier = 0.0f;
 							}
 
-							if (distance <= brakeStart) {
-								double brakeRamp = (distance - FULL_STOP_DISTANCE)
+							if (effectiveDistance <= brakeStart) {
+								double brakeRamp = (effectiveDistance - FULL_STOP_DISTANCE)
 										/ Math.max(0.01, brakeStart - FULL_STOP_DISTANCE);
 
 								brakeStrength = Math.clamp(1.0 - brakeRamp, 0.0, 1.0);
@@ -619,10 +695,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							}
 
 							lastDistance = distance;
-						}
-
-						if (currentStation != null && lastStationEdge != null && sameEdge(point.edge, lastStationEdge)) {
-							stationHoldActive = true;
 						}
 
 						n1ForSteering = n1;
@@ -650,8 +722,25 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			hasDirectionSignBeenSet = false;
 			lastSourceSign = 1.0;
 			lastForwardSign = 0;
+
+			debugInfo = (target == null && !scheduleStack.isEmpty()) ? "No valid destination" : "";
 		}
 
+		if (target != null && hasSource() && !hasValidPath) {
+			newMultiplier = 0.0f;
+			brakeStrength = 1.0;
+
+			if (debugInfo.isEmpty()) {
+				debugInfo = "No valid path";
+			}
+		}
+
+		if (departureHoldTicks > 0) {
+			newMultiplier = 0.0f;
+			brakeStrength = 1.0;
+		} else {
+			newMultiplier = clampAcceleration(newMultiplier);
+		}
 		boolean shouldDock = arrivedAtDestination;
 
 		setStoragePortsActive(
@@ -668,26 +757,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				shouldDock
 		);
 
-		PhysicsBogeyBlockEntity frontBogey = null;
-
-		if (hasValidPath && n1ForSteering != null && n2ForSteering != null) {
+		if (frontBogey == null && hasValidPath && n1ForSteering != null && n2ForSteering != null) {
 			Vec3 edgeForward = n2ForSteering.getLocation().getLocation()
 					.subtract(n1ForSteering.getLocation().getLocation())
 					.normalize();
 
 			Vec3 travelDir = movingTowardsNode2ForSteering ? edgeForward : edgeForward.scale(-1);
 
-			double maxDot = -Double.MAX_VALUE;
-
-			for (PhysicsBogeyBlockEntity bogey : consist) {
-				Vec3 bogeyPos = Vec3.atCenterOf(bogey.getBlockPos());
-				double dot = bogeyPos.dot(travelDir);
-
-				if (dot > maxDot) {
-					maxDot = dot;
-					frontBogey = bogey;
-				}
-			}
+			frontBogey = selectFrontBogey(consist, travelDir);
 		}
 
 		for (PhysicsBogeyBlockEntity bogey : consist) {
@@ -722,6 +799,70 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 	}
 
+	private float clampAcceleration(float desired) {
+		float current = currentSpeedMultiplier;
+
+		if (Math.abs(desired) < 0.01f) {
+			return 0.0f;
+		}
+
+		if (Math.abs(current) < 0.01f) {
+			return Math.copySign(Math.min(Math.abs(desired), ACCEL_BASE), desired);
+		}
+
+		if ((desired < 0.0f) != (current < 0.0f)) {
+			return 0.0f;
+		}
+
+		float absCurrent = Math.abs(current);
+		float absDesired = Math.abs(desired);
+
+		if (absDesired > absCurrent) {
+			float maxIncrease = ACCEL_BASE + absCurrent * ACCEL_SCALE;
+			float next = Math.min(absDesired, absCurrent + maxIncrease);
+
+			return desired < 0.0f ? -next : next;
+		}
+
+		float maxDecrease = 1.0f + absCurrent * 0.5f;
+		float next = Math.max(absDesired, absCurrent - maxDecrease);
+
+		return desired < 0.0f ? -next : next;
+	}
+
+	@Nullable
+	private PhysicsBogeyBlockEntity selectFrontBogey(Set<PhysicsBogeyBlockEntity> consist, Vec3 travelDir) {
+		PhysicsBogeyBlockEntity best = null;
+		double maxDot = -Double.MAX_VALUE;
+
+		for (PhysicsBogeyBlockEntity bogey : consist) {
+			Vec3 bogeyPos = Vec3.atCenterOf(bogey.getBlockPos());
+			double dot = bogeyPos.dot(travelDir);
+
+			if (dot > maxDot) {
+				maxDot = dot;
+				best = bogey;
+			}
+		}
+
+		return best;
+	}
+
+	private double computeFrontStopOffset(PhysicsBogeyBlockEntity anchorBogey,
+										  @Nullable PhysicsBogeyBlockEntity frontBogey,
+										  Vec3 travelDir) {
+		if (frontBogey == null || frontBogey == anchorBogey) {
+			return 0.0;
+		}
+
+		Vec3 anchorPos = Vec3.atCenterOf(anchorBogey.getBlockPos());
+		Vec3 frontPos = Vec3.atCenterOf(frontBogey.getBlockPos());
+
+		double offset = frontPos.subtract(anchorPos).dot(travelDir);
+
+		return Math.max(0.0, offset);
+	}
+
 	@Nullable
 	private Train findTrain(ServerLevel level, GlobalStation station, PhysicsBogeyBlockEntity anchorBogey) {
 		try {
@@ -731,7 +872,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 
 		TrackGraph graph = null;
-
 		PhysicsBogeyAxle axle = findAnchorAxle(anchorBogey);
 		if (axle != null) graph = axle.getTrackGraph();
 
@@ -741,17 +881,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 				try {
 					if (train.graph == graph && train.navigation != null && train.navigation.destination == station) {
-						return train;
-					}
-				} catch (Throwable ignored) {
-				}
-			}
-
-			for (Train train : Create.RAILWAYS.trains.values()) {
-				if (train == null) continue;
-
-				try {
-					if (train.graph == graph) {
 						return train;
 					}
 				} catch (Throwable ignored) {
@@ -1138,84 +1267,204 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 	private void updateDockingConnectors(ServerLevel level, Set<PhysicsBogeyBlockEntity> consist,
 										 @Nullable GlobalStation station, boolean active) {
-		if (active) {
-			Set<BlockPos> seen = new HashSet<>();
-			List<BlockPos> centers = new ArrayList<>();
+		if (!active) {
+			deactivateDockingConnectors(level);
+			return;
+		}
 
-			centers.add(worldPosition);
+		List<DockingConnectorBlockEntity> trainConnectors = collectTrainDockingConnectors(consist);
 
-			for (PhysicsBogeyBlockEntity bogey : consist) {
-				centers.add(bogey.getBlockPos());
+		Set<ConnectorRef> desired = new HashSet<>();
+		Set<ConnectorRef> previous = new HashSet<>(activatedDockingConnectors);
+
+		activatedDockingConnectors.clear();
+
+		for (DockingConnectorBlockEntity connector : trainConnectors) {
+			if (connector.isRemoved()) {
+				continue;
 			}
 
-			if (station != null) {
-				centers.add(station.getBlockEntityPos());
+			if (!(connector.getLevel() instanceof ServerLevel connectorLevel)) {
+				continue;
 			}
 
-			int radius = 16;
+			ConnectorRef ref = new ConnectorRef(connectorLevel, connector.getBlockPos());
 
-			for (BlockPos center : centers) {
-				BlockPos min = center.offset(-radius, -radius, -radius);
-				BlockPos max = center.offset(radius, radius, radius);
+			if (!desired.add(ref)) {
+				continue;
+			}
 
-				for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
-					BlockPos immutable = new BlockPos(pos.getX(), pos.getY(), pos.getZ());
+			boolean isNew = !previous.contains(ref);
 
-					if (!seen.add(immutable)) continue;
-
-					if (level.getBlockEntity(immutable) instanceof DockingConnectorBlockEntity connector) {
-						setDockingConnectorActive(connector, true);
-						activatedDockingConnectors.add(new ConnectorRef(level, immutable));
-					}
+			if (isNew) {
+				try {
+					connector.setVirtualLock(true);
+				} catch (Throwable ignored) {
 				}
 			}
 
-			dockingConnectorsActive = true;
-		} else if (dockingConnectorsActive || !activatedDockingConnectors.isEmpty()) {
-			deactivateDockingConnectors(level);
+			setDockingConnectorPowered(connector, true);
+		}
+
+		for (ConnectorRef ref : previous) {
+			if (!desired.contains(ref)) {
+				if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
+					try {
+						connector.setVirtualLock(false);
+					} catch (Throwable ignored) {
+					}
+
+					try {
+						connector.unDock();
+					} catch (Throwable ignored) {
+					}
+
+					setDockingConnectorPowered(connector, false);
+				}
+
+				undockNearbyDockingConnectors(ref.level(), ref.pos(), desired);
+			}
+		}
+
+		activatedDockingConnectors.addAll(desired);
+		dockingConnectorsActive = !activatedDockingConnectors.isEmpty();
+	}
+
+	private List<DockingConnectorBlockEntity> collectTrainDockingConnectors(Set<PhysicsBogeyBlockEntity> consist) {
+		Set<DockingConnectorBlockEntity> result = Collections.newSetFromMap(new IdentityHashMap<>());
+		Set<Object> seenSubLevels = Collections.newSetFromMap(new IdentityHashMap<>());
+
+		for (PhysicsBogeyBlockEntity bogey : consist) {
+			Level beLevel = bogey.getLevel();
+			if (beLevel == null) {
+				continue;
+			}
+
+			Object subLevel = getSubLevel(beLevel, bogey.getBlockPos(), bogey);
+
+			collectDockingConnectorsInSubLevel(
+					subLevel,
+					result,
+					seenSubLevels,
+					0
+			);
+		}
+
+		return new ArrayList<>(result);
+	}
+
+	private void collectDockingConnectorsInSubLevel(Object subLevel,
+													Set<DockingConnectorBlockEntity> out,
+													Set<Object> seenSubLevels,
+													int depth) {
+		if (subLevel == null || depth > SUBLEVEL_SCAN_DEPTH || !seenSubLevels.add(subLevel)) {
+			return;
+		}
+
+		for (BlockEntity be : getSubLevelBlockEntities(subLevel)) {
+			if (be instanceof DockingConnectorBlockEntity connector) {
+				if (!connector.isRemoved()) {
+					out.add(connector);
+				}
+			}
+		}
+
+		for (Object linked : getLinkedSubLevels(subLevel)) {
+			collectDockingConnectorsInSubLevel(
+					linked,
+					out,
+					seenSubLevels,
+					depth + 1
+			);
 		}
 	}
 
 	private void deactivateDockingConnectors(ServerLevel level) {
 		for (ConnectorRef ref : activatedDockingConnectors) {
 			if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
-				setDockingConnectorActive(connector, false);
+				try {
+					connector.setVirtualLock(false);
+				} catch (Throwable ignored) {
+				}
+
+				try {
+					connector.unDock();
+				} catch (Throwable ignored) {
+				}
+
+				setDockingConnectorPowered(connector, false);
 			}
+
+			undockNearbyDockingConnectors(ref.level(), ref.pos(), Collections.<ConnectorRef>emptySet());
 		}
 
 		activatedDockingConnectors.clear();
 		dockingConnectorsActive = false;
 	}
 
-	private void setDockingConnectorActive(DockingConnectorBlockEntity connector, boolean active) {
-		if (!(connector.getLevel() instanceof ServerLevel connectorLevel)) return;
+	private void undockNearbyDockingConnectors(ServerLevel level, BlockPos center, Set<ConnectorRef> skip) {
+		int r = DOCKING_CONNECTOR_SCAN_RADIUS;
+
+		BlockPos min = center.offset(-r, -r, -r);
+		BlockPos max = center.offset(r, r, r);
+
+		for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
+			BlockPos immutable = new BlockPos(pos.getX(), pos.getY(), pos.getZ());
+
+			if (immutable.distSqr(center) > DOCKING_CONNECTOR_MAX_PAIR_DISTANCE_SQ) {
+				continue;
+			}
+
+			ConnectorRef ref = new ConnectorRef(level, immutable);
+
+			if (skip.contains(ref)) {
+				continue;
+			}
+
+			if (level.getBlockEntity(immutable) instanceof DockingConnectorBlockEntity other) {
+				try {
+					other.setVirtualLock(false);
+				} catch (Throwable ignored) {
+				}
+
+				try {
+					other.unDock();
+				} catch (Throwable ignored) {
+				}
+
+				setDockingConnectorPowered(other, false);
+			}
+		}
+	}
+
+	private void setDockingConnectorPowered(DockingConnectorBlockEntity connector, boolean powered) {
+		if (!(connector.getLevel() instanceof ServerLevel connectorLevel)) {
+			return;
+		}
 
 		BlockPos pos = connector.getBlockPos();
 		BlockState state = connectorLevel.getBlockState(pos);
 
-		if (state.hasProperty(BlockStateProperties.POWERED) && state.getValue(BlockStateProperties.POWERED) != active) {
-			connectorLevel.setBlock(pos, state.setValue(BlockStateProperties.POWERED, active), 3);
-			state = connectorLevel.getBlockState(pos);
+		boolean changed = false;
+
+		if (state.hasProperty(BlockStateProperties.POWERED) && state.getValue(BlockStateProperties.POWERED) != powered) {
+			connectorLevel.setBlock(pos, state.setValue(BlockStateProperties.POWERED, powered), 2);
+			changed = true;
 		}
 
-		connector.powered = active;
+		if (connector.powered != powered) {
+			connector.powered = powered;
+			changed = true;
+		}
 
-		if (!active) {
-			try {
-				connector.setVirtualLock(false);
-			} catch (Throwable ignored) {
-			}
+		if (changed) {
+			connector.setChanged();
 
 			try {
-				connector.unDock();
+				connector.sendData();
 			} catch (Throwable ignored) {
 			}
 		}
-
-		connector.setChanged();
-
-		connectorLevel.sendBlockUpdated(pos, state, connectorLevel.getBlockState(pos), 3);
-		connectorLevel.updateNeighborsAt(pos, state.getBlock());
 	}
 
 	private void updateCustomStationPresence(ServerLevel level, @Nullable GlobalStation station) {
@@ -1353,21 +1602,37 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return null;
 	}
 
-	private boolean tickConditions(ServerLevel level, ScheduleEntry entry, @Nullable Train train, GlobalStation station) {
+	private boolean tickConditions(ServerLevel level, ScheduleEntry entry, @Nullable Train train,
+								   GlobalStation station, Set<PhysicsBogeyBlockEntity> consist) {
 		List<List<ScheduleWaitCondition>> columns = entry.conditions;
+
+		if (columns.isEmpty()) {
+			return true;
+		}
 
 		while (conditionProgress.size() < columns.size()) {
 			conditionProgress.add(0);
 			conditionContext.add(new CompoundTag());
 		}
 
+		boolean hasNonEmptyColumn = false;
+
 		for (int i = 0; i < columns.size(); i++) {
 			List<ScheduleWaitCondition> column = columns.get(i);
 
-			int progress = conditionProgress.get(i);
-			if (progress >= column.size()) return true;
+			if (column == null || column.isEmpty()) {
+				continue;
+			}
 
-			if (evaluateCondition(column.get(progress), level, conditionContext.get(i), train, station)) {
+			hasNonEmptyColumn = true;
+			int progress = conditionProgress.get(i);
+
+			if (progress >= column.size()) {
+				return true;
+			}
+
+			if (evaluateCondition(column.get(progress), level, conditionContext.get(i), train, station, consist)) {
+				conditionContext.set(i, new CompoundTag());
 				conditionProgress.set(i, progress + 1);
 
 				if (progress + 1 >= column.size()) {
@@ -1376,19 +1641,3393 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 		}
 
-		return false;
+		return !hasNonEmptyColumn;
 	}
 
 	private boolean evaluateCondition(ScheduleWaitCondition condition, ServerLevel level, CompoundTag context,
-									  @Nullable Train train, GlobalStation station) {
-		if (condition instanceof StationPoweredCondition) {
-			return level.hasNeighborSignal(station.getBlockEntityPos());
+									  @Nullable Train train, GlobalStation station,
+									  Set<PhysicsBogeyBlockEntity> consist) {
+		try {
+			if (condition instanceof StationPoweredCondition) {
+				return level.hasNeighborSignal(station.getBlockEntityPos());
+			}
+
+			if (condition instanceof CargoThresholdCondition cargo) {
+				return evaluateCreateCargoCondition(cargo, level, consist);
+			}
+
+			String simpleName = condition.getClass().getSimpleName().toLowerCase(Locale.ROOT);
+
+			if (condition instanceof ScheduledDelay || simpleName.contains("delay")) {
+				return evaluateScheduledDelay(condition, level, context);
+			}
+
+			debugInfo = "Unsupported condition: " + condition.getClass().getSimpleName();
+			return false;
+		} catch (Throwable t) {
+			debugInfo = "Condition error: " + t.getClass().getSimpleName();
+			return false;
+		}
+	}
+
+	private boolean evaluateScheduledDelay(ScheduleWaitCondition condition, ServerLevel level, CompoundTag context) {
+		int total = getDelayTicks(condition, level);
+
+		if (total < 0) {
+			debugInfo = "Delay not parsed: " + condition.getClass().getSimpleName();
+			return false;
+		}
+
+		if (total <= 0) {
+			return true;
+		}
+
+		long now = level.getGameTime();
+
+		if (!context.contains("SimuDelayStart", Tag.TAG_LONG)) {
+			context.putLong("SimuDelayStart", now);
+			debugInfo = String.format(
+					"Delay: 0 / %d ticks (%.1fs)",
+					total,
+					total / 20.0f
+			);
+			return false;
+		}
+
+		long start = context.getLong("SimuDelayStart");
+		long elapsed = now - start;
+
+		if (elapsed < 0) {
+			context.putLong("SimuDelayStart", now);
+			elapsed = 0;
+		}
+
+		debugInfo = String.format(
+				"Delay: %d / %d ticks (%.1fs / %.1fs)",
+				Math.min(elapsed, total),
+				total,
+				elapsed / 20.0f,
+				total / 20.0f
+		);
+
+		return elapsed >= total;
+	}
+
+	private int getDelayTicks(ScheduleWaitCondition condition, ServerLevel level) {
+		if (condition instanceof ScheduledDelay delay) {
+			try {
+				return delay.totalWaitTicks();
+			} catch (Throwable ignored) {
+			}
+		}
+
+		for (String methodName : new String[]{
+				"totalWaitTicks",
+				"getTotalWaitTicks",
+				"getDelayTicks",
+				"getTicks",
+				"getTotalTicks",
+				"getDelay",
+				"getTime",
+				"getValue",
+				"getAmount"
+		}) {
+			Object value = invokeNoArg(condition, methodName);
+			if (value instanceof Number number) {
+				return number.intValue();
+			}
+		}
+
+		for (String fieldName : new String[]{
+				"totalWaitTicks",
+				"ticks",
+				"delay",
+				"time",
+				"value",
+				"amount"
+		}) {
+			Object value = getFieldValue(condition, fieldName);
+			if (value instanceof Number number) {
+				return number.intValue();
+			}
+		}
+
+		CompoundTag tag = extractConditionTag(condition, level);
+		if (tag != null) {
+			for (String key : new String[]{
+					"Ticks",
+					"TotalTicks",
+					"Delay",
+					"Time",
+					"Value",
+					"Amount"
+			}) {
+				int value = readIntFromTag(tag, key);
+				if (value != Integer.MIN_VALUE) {
+					return value;
+				}
+			}
+
+			int days = readIntFromTag(tag, "Days");
+			int hours = readIntFromTag(tag, "Hours");
+			int minutes = readIntFromTag(tag, "Minutes");
+			int seconds = readIntFromTag(tag, "Seconds");
+			int ticks = readIntFromTag(tag, "Ticks");
+
+			if (days != Integer.MIN_VALUE
+					|| hours != Integer.MIN_VALUE
+					|| minutes != Integer.MIN_VALUE
+					|| seconds != Integer.MIN_VALUE
+					|| ticks != Integer.MIN_VALUE) {
+
+				int total = 0;
+
+				if (days != Integer.MIN_VALUE) {
+					total += days * 24000;
+				}
+
+				if (hours != Integer.MIN_VALUE) {
+					total += hours * 1000;
+				}
+
+				if (minutes != Integer.MIN_VALUE) {
+					total += minutes * 20;
+				}
+
+				if (seconds != Integer.MIN_VALUE) {
+					total += seconds * 20;
+				}
+
+				if (ticks != Integer.MIN_VALUE) {
+					total += ticks;
+				}
+
+				return total;
+			}
+		}
+
+		return -1;
+	}
+
+	private int readIntFromTag(CompoundTag tag, String key) {
+		if (hasNumericTag(tag, key)) {
+			return tag.getInt(key);
+		}
+
+		if (tag.contains(key, Tag.TAG_STRING)) {
+			try {
+				return Integer.parseInt(tag.getString(key).trim());
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return Integer.MIN_VALUE;
+	}
+
+	private boolean evaluateCreateCargoCondition(CargoThresholdCondition cargo, ServerLevel level,
+												 Set<PhysicsBogeyBlockEntity> consist) {
+		CargoThresholdCondition.Ops op;
+		int threshold;
+		int measure;
+
+		try {
+			op = cargo.getOperator();
+			threshold = cargo.getThreshold();
+			measure = cargo.getMeasure();
+		} catch (Throwable t) {
+			debugInfo = "Cargo condition API error: " + t.getClass().getSimpleName();
+			return false;
+		}
+
+		if (op == null) {
+			debugInfo = "Cargo operator not parsed";
+			return false;
+		}
+
+		Object filter = extractConditionFilter(cargo, level);
+		boolean fluid = isFluidCargoCondition(cargo, filter);
+		String filterText = filterDescription(filter, level);
+
+		if (fluid) {
+			int current = countFluidsAll(null, consist, filter);
+			int target = threshold;
+
+			if (measure == 1 || summaryContains(cargo, "bucket")) {
+				target *= 1000;
+			}
+
+			debugInfo = String.format(
+					"Fluid cargo: %d / %d mB %s filter=%s",
+					current,
+					target,
+					op.formatted,
+					filterText
+			);
+
+			return op.test(current, target);
+		}
+
+		int currentItems = countItemsAll(null, consist, filter, false);
+
+		boolean stacks = measure == 1 || summaryContains(cargo, "stack");
+
+		if (stacks) {
+			int stackSize = Math.max(1, getFilterStackSize(filter, level));
+			int currentStacks = currentItems <= 0 ? 0 : 1 + (currentItems - 1) / stackSize;
+
+			debugInfo = String.format(
+					"Stack cargo: %d / %d stacks (%d items, stack size %d) %s filter=%s",
+					currentStacks,
+					threshold,
+					currentItems,
+					stackSize,
+					op.formatted,
+					filterText
+			);
+
+			return op.test(currentStacks, threshold);
+		}
+
+		debugInfo = String.format(
+				"Item cargo: %d / %d %s filter=%s",
+				currentItems,
+				threshold,
+				op.formatted,
+				filterText
+		);
+
+		return op.test(currentItems, threshold);
+	}
+
+	private boolean isFluidCargoCondition(CargoThresholdCondition cargo, @Nullable Object filter) {
+		String name = cargo.getClass().getSimpleName().toLowerCase(Locale.ROOT);
+
+		if (name.contains("fluid")) {
+			return true;
+		}
+
+		if (filter instanceof FluidStack) {
+			return true;
+		}
+
+		if (filter != null && filter.getClass().getSimpleName().toLowerCase(Locale.ROOT).contains("fluid")) {
+			return true;
+		}
+
+		return summaryContains(cargo, "bucket") || summaryContains(cargo, "mb");
+	}
+
+	private boolean summaryContains(CargoThresholdCondition cargo, String needle) {
+		try {
+			Component text = cargo.getSummary().getSecond();
+			return text != null && text.getString()
+					.toLowerCase(Locale.ROOT)
+					.contains(needle.toLowerCase(Locale.ROOT));
+		} catch (Throwable ignored) {
+			return false;
+		}
+	}
+
+	@Nullable
+	private Object extractConditionFilter(ScheduleWaitCondition condition, ServerLevel level) {
+		for (String methodName : new String[]{
+				"getFilter",
+				"getFilterStack",
+				"getFilterItemStack",
+				"getItemFilter",
+				"getFluidFilter",
+				"getFilterFluid",
+				"getFluidStack"
+		}) {
+			Object value = unwrapOptional(invokeNoArg(condition, methodName));
+
+			if (value == null) {
+				continue;
+			}
+
+			if (value instanceof ItemStack stack && stack.isEmpty()) {
+				continue;
+			}
+
+			if (value instanceof FluidStack fluid && fluid.isEmpty()) {
+				continue;
+			}
+
+			return value;
+		}
+
+		Object directData = getFieldValue(condition, "data");
+		if (directData instanceof CompoundTag dataTag) {
+			Object parsed = parseConditionFilterFromTag(dataTag, level);
+			if (parsed != null) {
+				return parsed;
+			}
+		}
+
+		CompoundTag tag = extractConditionTag(condition, level);
+		if (tag != null) {
+			Object parsed = parseConditionFilterFromTag(tag, level);
+			if (parsed != null) {
+				return parsed;
+			}
+		}
+
+		return extractItemFilterObject(condition, level);
+	}
+
+	@Nullable
+	private Object parseConditionFilterFromTag(CompoundTag tag, ServerLevel level) {
+		Object createFilter = parseCreateFilterTag(tag, level);
+		if (createFilter != null) {
+			return createFilter;
+		}
+
+		Object fluid = parseFluidFilterTag(tag, level);
+		if (fluid != null) {
+			return fluid;
+		}
+
+		ItemStack item = parseFilterTag(tag, level);
+		if (item != null && !item.isEmpty()) {
+			return item;
+		}
+
+		return null;
+	}
+
+	private int getFilterStackSize(@Nullable Object filter, ServerLevel level) {
+		ItemStack stack = resolveFilterItemStack(filter, level);
+
+		if (stack != null && !stack.isEmpty()) {
+			return Math.max(1, stack.getMaxStackSize());
+		}
+
+		if (filter != null) {
+			for (String methodName : new String[]{
+					"getMaxStackSize",
+					"getStackSize",
+					"getCapacity"
+			}) {
+				Object value = invokeNoArg(filter, methodName);
+
+				if (value instanceof Number number && number.intValue() > 0) {
+					return number.intValue();
+				}
+			}
+		}
+
+		return 64;
+	}
+
+	@Nullable
+	private ItemStack resolveFilterItemStack(@Nullable Object filter, ServerLevel level) {
+		return resolveFilterItemStack(filter, level, 0);
+	}
+
+	@Nullable
+	private ItemStack resolveFilterItemStack(@Nullable Object filter, ServerLevel level, int depth) {
+		if (filter == null || depth > 3) {
+			return null;
+		}
+
+		if (filter instanceof ItemStack stack) {
+			if (stack.isEmpty()) {
+				return null;
+			}
+
+			try {
+				String id = String.valueOf(BuiltInRegistries.ITEM.getKey(stack.getItem()));
+
+				if (id.toLowerCase().contains("filter")) {
+					CompoundTag tag = getStackTag(stack, level);
+
+					if (tag != null) {
+						ItemStack parsed = parseFilterTag(tag, level);
+
+						if (parsed != null && !parsed.isEmpty()) {
+							return resolveFilterItemStack(parsed, level, depth + 1);
+						}
+					}
+				}
+			} catch (Throwable ignored) {
+			}
+
+			return stack;
+		}
+
+		if (filter instanceof IItemHandler handler) {
+			if (handler.getSlots() > 0) {
+				ItemStack stack = handler.getStackInSlot(0);
+
+				if (stack != null && !stack.isEmpty()) {
+					return resolveFilterItemStack(stack, level, depth + 1);
+				}
+			}
+		}
+
+		if (filter instanceof Container container) {
+			if (container.getContainerSize() > 0) {
+				ItemStack stack = container.getItem(0);
+
+				if (stack != null && !stack.isEmpty()) {
+					return resolveFilterItemStack(stack, level, depth + 1);
+				}
+			}
+		}
+
+		Object underlying = getUnderlyingFilterStack(filter);
+
+		if (underlying instanceof ItemStack stack && underlying != filter) {
+			return resolveFilterItemStack(stack, level, depth + 1);
+		}
+
+		for (String getter : new String[]{
+				"getItemStack",
+				"getStack",
+				"getItem",
+				"getFilterStack",
+				"getFilter"
+		}) {
+			Object value = unwrapOptional(invokeNoArg(filter, getter));
+
+			if (value instanceof ItemStack stack && value != filter && !stack.isEmpty()) {
+				return resolveFilterItemStack(stack, level, depth + 1);
+			}
+		}
+
+		return null;
+	}
+
+	private String filterDescription(@Nullable Object filter, @Nullable ServerLevel level) {
+		String desc = describeFilterObject(filter, level, 0);
+		return desc == null || desc.isEmpty() ? "any" : desc;
+	}
+
+	@Nullable
+	private String describeFilterObject(@Nullable Object obj, @Nullable ServerLevel level, int depth) {
+		if (obj == null || depth > 4) return null;
+
+		if (obj instanceof ItemStack stack) {
+			return describeItemStack(stack, level, depth);
+		}
+
+		if (obj instanceof FluidStack fluid) {
+			return describeFluidStack(fluid);
+		}
+
+		if (obj instanceof Component component) {
+			return sanitizeDescription(component.getString());
+		}
+
+		if (obj instanceof String s) {
+			return sanitizeDescription(s);
+		}
+
+		if (obj instanceof IItemHandler handler) {
+			for (int i = 0; i < handler.getSlots(); i++) {
+				ItemStack stack = handler.getStackInSlot(i);
+				if (!stack.isEmpty()) {
+					return describeItemStack(stack, level, depth + 1);
+				}
+			}
+			return "empty";
+		}
+
+		if (obj instanceof Container container) {
+			for (int i = 0; i < container.getContainerSize(); i++) {
+				ItemStack stack = container.getItem(i);
+				if (stack != null && !stack.isEmpty()) {
+					return describeItemStack(stack, level, depth + 1);
+				}
+			}
+			return "empty";
+		}
+
+		for (String getter : new String[]{
+				"getFilterDescription", "getDescription", "getDisplayName",
+				"getFilter", "getItemStack", "getStack", "getItem",
+				"getFilterStack", "getFilterItemStack", "getFilterItem",
+				"getFluidStack", "getFluid", "getFilterFluid"
+		}) {
+			Object ret = unwrapOptional(invokeNoArg(obj, getter));
+
+			if (ret != null && ret != obj) {
+				String desc = describeFilterObject(ret, level, depth + 1);
+				if (desc != null) return desc;
+			}
 		}
 
 		try {
-			return condition.tickCompletion(level, train, context);
+			for (Method method : obj.getClass().getMethods()) {
+				if (method.getParameterCount() != 0) continue;
+				if (Modifier.isStatic(method.getModifiers())) continue;
+
+				String name = method.getName().toLowerCase();
+				if (name.equals("getclass")) continue;
+
+				int score = descriptionMethodNameScore(name);
+				if (score <= 0) continue;
+
+				Class<?> retType = method.getReturnType();
+				if (retType == void.class || retType.isPrimitive()) continue;
+				if (Number.class.isAssignableFrom(retType)) continue;
+				if (retType == Boolean.class || retType == Character.class) continue;
+
+				trySetAccessible(method);
+
+				Object ret = unwrapOptional(method.invoke(obj));
+				if (ret == null || ret == obj) continue;
+
+				String desc = describeFilterObject(ret, level, depth + 1);
+				if (desc != null) return desc;
+			}
 		} catch (Throwable ignored) {
+		}
+
+		Class<?> c = obj.getClass();
+		while (c != null && c != Object.class) {
+			for (Field field : c.getDeclaredFields()) {
+				int modifiers = field.getModifiers();
+				if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+				String name = field.getName().toLowerCase();
+				int score = descriptionFieldNameScore(name);
+				if (score <= 0) continue;
+
+				trySetAccessible(field);
+
+				try {
+					Object value = field.get(obj);
+					if (value == null || value == obj) continue;
+
+					String desc = describeFilterObject(value, level, depth + 1);
+					if (desc != null) return desc;
+				} catch (Throwable ignored) {
+				}
+			}
+			c = c.getSuperclass();
+		}
+
+		return usefulToString(obj);
+	}
+
+	private String describeItemStack(ItemStack stack, @Nullable ServerLevel level, int depth) {
+		if (stack.isEmpty()) return "empty";
+
+		try {
+			String id = String.valueOf(BuiltInRegistries.ITEM.getKey(stack.getItem()));
+			int count = stack.getCount();
+
+			if (level != null && depth < 3 && id.toLowerCase().contains("filter")) {
+				CompoundTag tag = getStackTag(stack, level);
+
+				if (tag != null) {
+					String inner = describeItemFilterTag(tag, level, depth + 1);
+					if (inner == null) inner = describeFluidFilterTag(tag, level);
+					if (inner != null && !inner.isEmpty()) {
+						return inner;
+					}
+				}
+			}
+
+			String readableName = getReadableItemName(stack, id);
+
+			if (count != 1) {
+				return readableName + " x" + count;
+			}
+
+			return readableName;
+		} catch (Throwable ignored) {
+			return "unknown item";
+		}
+	}
+
+	private String getReadableItemName(ItemStack stack, String fallbackId) {
+		try {
+			Component hoverName = stack.getHoverName();
+			if (hoverName != null) {
+				String name = hoverName.getString();
+				if (name != null && !name.isEmpty() && !name.equals(fallbackId)) {
+					return name;
+				}
+			}
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			String descId = stack.getItem().getDescriptionId(stack);
+			Component translatable = Component.translatable(descId);
+			String name = translatable.getString();
+			if (name != null && !name.isEmpty() && !name.equals(descId)) {
+				return name;
+			}
+		} catch (Throwable ignored) {
+		}
+
+		return prettifyId(fallbackId);
+	}
+
+	private String prettifyId(String id) {
+		String name = id;
+		int colon = name.indexOf(':');
+		if (colon >= 0) {
+			String namespace = name.substring(0, colon);
+			if (namespace.equals("minecraft")) {
+				name = name.substring(colon + 1);
+			}
+		}
+
+		name = name.replace('/', ' ').replace('_', ' ');
+		StringBuilder sb = new StringBuilder();
+		boolean capitalizeNext = true;
+
+		for (char ch : name.toCharArray()) {
+			if (ch == ' ') {
+				sb.append(' ');
+				capitalizeNext = true;
+			} else if (capitalizeNext) {
+				sb.append(Character.toUpperCase(ch));
+				capitalizeNext = false;
+			} else {
+				sb.append(ch);
+			}
+		}
+
+		return sb.toString();
+	}
+
+	private String describeFluidStack(FluidStack stack) {
+		if (stack.isEmpty()) return "empty fluid";
+
+		try {
+			String id = String.valueOf(BuiltInRegistries.FLUID.getKey(stack.getFluid()));
+			int amount = stack.getAmount();
+
+			String readableName = prettifyId(id);
+
+			if (amount != 0 && amount != 1000) {
+				return readableName + " x" + amount + "mB";
+			}
+
+			return readableName;
+		} catch (Throwable ignored) {
+			return "unknown fluid";
+		}
+	}
+
+	@Nullable
+	private CompoundTag getStackTag(ItemStack stack, Level saveLevel) {
+		try {
+			Object tag = invokeNoArg(stack, "getTag");
+			if (tag instanceof CompoundTag compound) return compound;
+		} catch (Throwable ignored) {
+		}
+
+		CompoundTag saved = saveStackToTag(stack, saveLevel);
+
+		if (saved != null) {
+			if (saved.contains("tag", Tag.TAG_COMPOUND)) return saved.getCompound("tag");
+			if (saved.contains("components", Tag.TAG_COMPOUND)) return saved.getCompound("components");
+			return saved;
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private String describeItemFilterTag(CompoundTag tag, ServerLevel level, int depth) {
+		for (String key : new String[]{
+				"Filter", "Item", "ItemStack", "Stack",
+				"ItemFilter", "FilterItem", "FilterItemStack"
+		}) {
+			if (!tag.contains(key)) continue;
+
+			Tag sub = tag.get(key);
+			if (sub == null) continue;
+
+			try {
+				Optional<ItemStack> parsed = ItemStack.parse(level.registryAccess(), sub);
+				if (parsed.isPresent() && !parsed.get().isEmpty()) {
+					return describeItemStack(parsed.get(), level, depth + 1);
+				}
+			} catch (Throwable ignored) {
+			}
+
+			if (sub instanceof CompoundTag compound && compound.contains("id")) {
+				String id = compound.getString("id");
+				int count = 1;
+
+				if (compound.contains("Count", Tag.TAG_BYTE)) {
+					count = compound.getByte("Count");
+				} else if (compound.contains("count")) {
+					count = compound.getInt("count");
+				}
+
+				if (!id.isEmpty()) {
+					String readable = prettifyId(id);
+					return count != 1 ? readable + " x" + count : readable;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private String describeFluidFilterTag(CompoundTag tag, ServerLevel level) {
+		try {
+			Object parsed = parseFluidFilterTag(tag, level);
+			if (parsed instanceof FluidStack fluidStack && !fluidStack.isEmpty()) {
+				return describeFluidStack(fluidStack);
+			}
+		} catch (Throwable ignored) {
+		}
+
+		for (String key : new String[]{"Fluid", "FluidStack", "Filter", "Stack", "FluidFilter"}) {
+			if (!tag.contains(key, Tag.TAG_COMPOUND)) continue;
+
+			CompoundTag compound = tag.getCompound(key);
+
+			String id = null;
+			if (compound.contains("FluidName")) id = compound.getString("FluidName");
+			else if (compound.contains("Name")) id = compound.getString("Name");
+
+			if (id != null && !id.isEmpty()) {
+				int amount = 0;
+				if (compound.contains("Amount")) amount = compound.getInt("Amount");
+				else if (compound.contains("amount")) amount = compound.getInt("amount");
+
+				String readable = prettifyId(id);
+				return amount != 0 && amount != 1000
+						? readable + " x" + amount + "mB"
+						: readable;
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private String sanitizeDescription(@Nullable String s) {
+		if (s == null) return null;
+		s = s.trim();
+		if (s.isEmpty()) return null;
+		if (s.length() > 120) s = s.substring(0, 117) + "...";
+		if (s.matches("^[A-Za-z0-9_$.]+@[0-9a-fA-F]+$")) return null;
+
+		String lower = s.toLowerCase();
+		if ((lower.startsWith("com.") || lower.startsWith("net.") || lower.startsWith("dev.") || lower.startsWith("org."))
+				&& !s.contains(":") && !s.contains(" ") && !s.contains("=") && !s.contains("{")) {
+			return null;
+		}
+
+		return s;
+	}
+
+	@Nullable
+	private String usefulToString(Object obj) {
+		try {
+			String s = String.valueOf(obj);
+			if (s == null) return null;
+
+			String className = obj.getClass().getName();
+			String simpleName = obj.getClass().getSimpleName();
+
+			if (s.equals(className) || s.equals(simpleName)) return null;
+			if (s.contains("@") && !s.contains("{") && !s.contains("=") && !s.contains(":") && !s.contains(" ")) return null;
+
+			if (s.startsWith(className) || s.startsWith(simpleName)) {
+				int brace = s.indexOf('{');
+				if (brace >= 0 && s.endsWith("}")) {
+					String inner = s.substring(brace + 1, s.length() - 1).trim();
+					if (!inner.isEmpty()) return sanitizeDescription(inner);
+				}
+
+				int bracket = s.indexOf('[');
+				if (bracket >= 0 && s.endsWith("]")) {
+					String inner = s.substring(bracket + 1, s.length() - 1).trim();
+					if (!inner.isEmpty()) return sanitizeDescription(inner);
+				}
+			}
+
+			return sanitizeDescription(s);
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	private int descriptionMethodNameScore(String n) {
+		int score = 0;
+		if (n.contains("description")) score += 100;
+		if (n.contains("displayname") || n.contains("hovername") || n.contains("tooltip") || n.contains("label")) score += 90;
+		if (n.contains("filter")) score += 80;
+		if (n.contains("fluidstack") || n.contains("fluid")) score += 75;
+		if (n.contains("itemstack") || n.contains("stack")) score += 70;
+		if (n.contains("item")) score += 60;
+		if (n.contains("name") || n.contains("text") || n.contains("string") || n.contains("component")) score += 40;
+		if (n.contains("icon") || n.contains("ghost") || n.contains("animation")) score -= 100;
+		return score;
+	}
+
+	private int descriptionFieldNameScore(String n) {
+		int score = 0;
+		if (n.contains("description")) score += 100;
+		if (n.contains("displayname") || n.contains("hovername") || n.contains("tooltip") || n.contains("label")) score += 90;
+		if (n.contains("filter")) score += 80;
+		if (n.contains("fluidstack") || n.contains("fluid")) score += 75;
+		if (n.contains("itemstack") || n.contains("stack")) score += 70;
+		if (n.contains("item")) score += 60;
+		if (n.contains("name") || n.contains("text") || n.contains("string") || n.contains("component")) score += 40;
+		if (n.contains("icon") || n.contains("ghost") || n.contains("animation")) score -= 100;
+		return score;
+	}
+
+	private boolean hasNumericTag(CompoundTag tag, String key) {
+		return tag.contains(key, Tag.TAG_BYTE)
+				|| tag.contains(key, Tag.TAG_SHORT)
+				|| tag.contains(key, Tag.TAG_INT)
+				|| tag.contains(key, Tag.TAG_LONG)
+				|| tag.contains(key, Tag.TAG_FLOAT)
+				|| tag.contains(key, Tag.TAG_DOUBLE);
+	}
+
+	@Nullable
+	private CompoundTag extractConditionTag(ScheduleWaitCondition condition, ServerLevel level) {
+		String[] methodNames = {
+				"write",
+				"save",
+				"serializeNBT",
+				"toNbt",
+				"toTag",
+				"writeToNBT",
+				"saveToNBT"
+		};
+
+		Object provider = level.registryAccess();
+
+		Class<?> c = condition.getClass();
+		while (c != null && c != Object.class) {
+			Set<Method> methods = new LinkedHashSet<>();
+			methods.addAll(Arrays.asList(c.getMethods()));
+			methods.addAll(Arrays.asList(c.getDeclaredMethods()));
+
+			for (Method method : methods) {
+				if (Modifier.isStatic(method.getModifiers())) continue;
+
+				boolean wanted = false;
+
+				for (String name : methodNames) {
+					if (name.equals(method.getName())) {
+						wanted = true;
+						break;
+					}
+				}
+
+				if (!wanted) continue;
+
+				trySetAccessible(method);
+
+				Class<?>[] params = method.getParameterTypes();
+
+				try {
+					if (params.length == 0) {
+						Object ret = method.invoke(condition);
+
+						if (ret instanceof CompoundTag tag) {
+							return tag;
+						}
+					} else if (params.length == 1) {
+						if (params[0].isAssignableFrom(CompoundTag.class)) {
+							CompoundTag tag = new CompoundTag();
+							Object ret = method.invoke(condition, tag);
+
+							if (ret instanceof CompoundTag returned) {
+								return returned;
+							}
+
+							return tag;
+						}
+
+						if (provider != null && params[0].isAssignableFrom(provider.getClass())) {
+							Object ret = method.invoke(condition, provider);
+
+							if (ret instanceof CompoundTag tag) {
+								return tag;
+							}
+						}
+					} else if (params.length == 2) {
+						boolean p0Tag = params[0].isAssignableFrom(CompoundTag.class);
+						boolean p1Tag = params[1].isAssignableFrom(CompoundTag.class);
+
+						boolean p0Provider = provider != null && params[0].isAssignableFrom(provider.getClass());
+						boolean p1Provider = provider != null && params[1].isAssignableFrom(provider.getClass());
+
+						if (p0Tag && p1Provider) {
+							CompoundTag tag = new CompoundTag();
+							Object ret = method.invoke(condition, tag, provider);
+
+							if (ret instanceof CompoundTag returned) {
+								return returned;
+							}
+
+							return tag;
+						}
+
+						if (p1Tag && p0Provider) {
+							CompoundTag tag = new CompoundTag();
+							Object ret = method.invoke(condition, provider, tag);
+
+							if (ret instanceof CompoundTag returned) {
+								return returned;
+							}
+
+							return tag;
+						}
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+
+			c = c.getSuperclass();
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object parseCreateFilterTag(CompoundTag tag, ServerLevel level) {
+		String[] classNames = {
+				"com.simibubi.create.content.logistics.filter.FilterItemStack",
+				"com.simibubi.create.content.logistics.filter.FilterItemStack$FilterItemStack",
+				"com.simibubi.create.content.logistics.filter.ItemFilterStack"
+		};
+
+		for (String className : classNames) {
+			try {
+				Class<?> clazz = Class.forName(className);
+
+				for (String key : new String[]{
+						"Filter",
+						"Item",
+						"ItemStack",
+						"Stack",
+						"ItemFilter",
+						"FilterItem",
+						"FilterItemStack"
+				}) {
+					if (!tag.contains(key)) continue;
+
+					Tag sub = tag.get(key);
+					if (sub == null) continue;
+
+					Object parsed = tryStaticFilterParse(clazz, sub, level);
+					if (parsed != null) return parsed;
+
+					if (sub instanceof CompoundTag compound) {
+						Object fromTag = tryStaticFilterFromTag(clazz, compound, level);
+						if (fromTag != null) return fromTag;
+					}
+				}
+
+				Object whole = tryStaticFilterFromTag(clazz, tag, level);
+				if (whole != null) return whole;
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object tryStaticFilterParse(Class<?> clazz, Tag tag, ServerLevel level) {
+		String[] names = {
+				"parse",
+				"fromTag",
+				"fromNbt",
+				"deserializeNBT",
+				"of",
+				"from",
+				"fromStackTag",
+				"fromFilterTag"
+		};
+
+		Object provider = level.registryAccess();
+
+		for (Method method : clazz.getMethods()) {
+			if (!Modifier.isStatic(method.getModifiers())) continue;
+
+			boolean nameOk = false;
+
+			for (String name : names) {
+				if (name.equals(method.getName())) {
+					nameOk = true;
+					break;
+				}
+			}
+
+			if (!nameOk) continue;
+
+			Class<?>[] params = method.getParameterTypes();
+
+			try {
+				if (params.length == 1 && params[0].isAssignableFrom(tag.getClass())) {
+					Object ret = unwrapOptional(method.invoke(null, tag));
+					if (ret != null) return ret;
+				}
+
+				if (params.length == 2) {
+					boolean p0Provider = provider != null && params[0].isAssignableFrom(provider.getClass());
+					boolean p1Provider = provider != null && params[1].isAssignableFrom(provider.getClass());
+
+					boolean p0Tag = params[0].isAssignableFrom(tag.getClass());
+					boolean p1Tag = params[1].isAssignableFrom(tag.getClass());
+
+					if (p0Provider && p1Tag) {
+						Object ret = unwrapOptional(method.invoke(null, provider, tag));
+						if (ret != null) return ret;
+					} else if (p1Provider && p0Tag) {
+						Object ret = unwrapOptional(method.invoke(null, tag, provider));
+						if (ret != null) return ret;
+					}
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		try {
+			Object ret = unwrapOptional(clazz.getConstructor(Tag.class).newInstance(tag));
+			if (ret != null) return ret;
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			Object ret = unwrapOptional(clazz.getConstructor(CompoundTag.class).newInstance(tag));
+			if (ret != null) return ret;
+		} catch (Throwable ignored) {
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object tryStaticFilterFromTag(Class<?> clazz, CompoundTag tag, ServerLevel level) {
+		return tryStaticFilterParse(clazz, tag, level);
+	}
+
+	@Nullable
+	private Object parseFluidFilterTag(CompoundTag tag, ServerLevel level) {
+		for (String key : new String[]{"Filter", "Fluid", "FluidStack", "Stack", "FluidFilter"}) {
+			if (!tag.contains(key)) continue;
+
+			Tag sub = tag.get(key);
+			if (sub == null) continue;
+
+			Object provider = level.registryAccess();
+
+			for (Method m : FluidStack.class.getMethods()) {
+				if (!Modifier.isStatic(m.getModifiers())) continue;
+				if (!m.getName().equals("parse") || m.getParameterCount() != 2) continue;
+
+				Class<?>[] p = m.getParameterTypes();
+
+				try {
+					boolean p0Provider = provider != null && p[0].isAssignableFrom(provider.getClass());
+					boolean p1Provider = provider != null && p[1].isAssignableFrom(provider.getClass());
+
+					boolean p0Tag = p[0].isAssignableFrom(sub.getClass());
+					boolean p1Tag = p[1].isAssignableFrom(sub.getClass());
+
+					if (p0Provider && p1Tag) {
+						Object ret = unwrapOptional(m.invoke(null, provider, sub));
+						if (ret != null) return ret;
+					} else if (p1Provider && p0Tag) {
+						Object ret = unwrapOptional(m.invoke(null, sub, provider));
+						if (ret != null) return ret;
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+
+			if (sub instanceof CompoundTag compound) {
+				for (Method m : FluidStack.class.getMethods()) {
+					if (!Modifier.isStatic(m.getModifiers())) continue;
+					if (m.getParameterCount() != 1) continue;
+
+					String name = m.getName();
+
+					if (!name.equals("loadFluidStackFromNBT")
+							&& !name.equals("load")
+							&& !name.equals("fromNbt")
+							&& !name.equals("fromTag")) {
+						continue;
+					}
+
+					if (!m.getParameterTypes()[0].isAssignableFrom(CompoundTag.class)) continue;
+
+					try {
+						Object ret = unwrapOptional(m.invoke(null, compound));
+						if (ret != null) return ret;
+					} catch (Throwable ignored) {
+					}
+				}
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object extractItemFilterObject(ScheduleWaitCondition condition, ServerLevel level) {
+		Object bestFilter = null;
+		int bestScore = Integer.MIN_VALUE;
+
+		Class<?> c = condition.getClass();
+		while (c != null && c != Object.class) {
+			for (Field field : c.getDeclaredFields()) {
+				int mods = field.getModifiers();
+
+				if (Modifier.isStatic(mods) || field.isSynthetic()) {
+					continue;
+				}
+
+				trySetAccessible(field);
+
+				String fieldName = field.getName().toLowerCase();
+
+				try {
+					Object value = field.get(condition);
+					if (value == null) continue;
+
+					if (isCreateFilterObject(value)) {
+						int score = scoreFilterFieldName(fieldName) + 1000;
+
+						if (score > bestScore) {
+							bestScore = score;
+							bestFilter = value;
+						}
+					}
+
+					if (value instanceof ItemStack stack) {
+						int score = scoreFilterFieldName(fieldName);
+
+						if (score > bestScore) {
+							bestScore = score;
+							bestFilter = stack;
+						}
+					}
+
+					if (value instanceof IItemHandler handler && handler.getSlots() > 0) {
+						ItemStack stack = handler.getStackInSlot(0);
+
+						if (stack != null) {
+							int score = scoreFilterFieldName(fieldName) - 50;
+
+							if (score > bestScore) {
+								bestScore = score;
+								bestFilter = stack;
+							}
+						}
+					}
+
+					for (String getter : new String[]{
+							"getFilter",
+							"getItemStack",
+							"getStack",
+							"getItem",
+							"getFilterStack",
+							"getItemFilter"
+					}) {
+						Object filterObj = unwrapOptional(invokeNoArg(value, getter));
+						if (filterObj == null) continue;
+
+						int score = scoreFilterGetterName(getter);
+
+						if (isCreateFilterObject(filterObj)) {
+							score += 1000;
+
+							if (score > bestScore) {
+								bestScore = score;
+								bestFilter = filterObj;
+							}
+						} else if (filterObj instanceof ItemStack stack) {
+							if (score > bestScore) {
+								bestScore = score;
+								bestFilter = stack;
+							}
+						} else if (filterObj instanceof IItemHandler handler && handler.getSlots() > 0) {
+							ItemStack stack = handler.getStackInSlot(0);
+
+							if (stack != null) {
+								score -= 50;
+
+								if (score > bestScore) {
+									bestScore = score;
+									bestFilter = stack;
+								}
+							}
+						}
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+
+			c = c.getSuperclass();
+		}
+
+		if (bestFilter != null && (bestScore >= 0 || isCreateFilterObject(bestFilter))) {
+			return bestFilter;
+		}
+
+		CompoundTag tag = extractConditionTag(condition, level);
+		if (tag != null) {
+			Object createFilter = parseCreateFilterTag(tag, level);
+			if (createFilter != null) {
+				return createFilter;
+			}
+
+			ItemStack parsed = parseFilterTag(tag, level);
+			if (parsed != null) {
+				return parsed;
+			}
+		}
+
+		return null;
+	}
+
+	private int scoreFilterFieldName(String name) {
+		int score = 0;
+
+		if (name.contains("filter")) score += 100;
+		if (name.contains("cargo")) score += 15;
+		if (name.contains("item")) score += 20;
+		if (name.contains("stack")) score += 10;
+
+		if (name.contains("icon") || name.contains("display") || name.contains("ghost") || name.contains("animation")) {
+			score -= 100;
+		}
+
+		return score;
+	}
+
+	private int scoreFilterGetterName(String name) {
+		String n = name.toLowerCase();
+
+		int score = 0;
+
+		if (n.contains("filter")) score += 100;
+		if (n.contains("itemstack")) score += 30;
+		if (n.contains("stack")) score += 20;
+		if (n.contains("item")) score += 10;
+
+		if (n.contains("icon") || n.contains("display") || n.contains("ghost")) {
+			score -= 100;
+		}
+
+		return score;
+	}
+
+	private boolean isCreateFilterObject(Object obj) {
+		if (obj == null || obj instanceof ItemStack) return false;
+
+		String name = obj.getClass().getName().toLowerCase();
+
+		if (name.contains("filteritemstack") || name.contains("itemfilter")) {
+			return true;
+		}
+
+		if (name.contains("filter")) {
+			return hasFilterMatchMethod(obj);
+		}
+
+		return false;
+	}
+
+	private boolean hasFilterMatchMethod(Object obj) {
+		String[] names = {
+				"test",
+				"matches",
+				"matchesItem",
+				"matchesStack",
+				"itemMatches",
+				"testStack",
+				"testItem",
+				"accepts",
+				"isValid",
+				"filterTest",
+				"matchesFilter",
+				"testFilter",
+				"matchesItemStack",
+				"testItemStack",
+				"match",
+				"apply"
+		};
+
+		for (Method method : obj.getClass().getMethods()) {
+			String methodName = method.getName();
+
+			for (String name : names) {
+				if (methodName.equals(name) && (method.getParameterCount() == 1 || method.getParameterCount() == 2)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	@Nullable
+	private Object tryWrapAsCreateFilter(ItemStack stack) {
+		if (stack.isEmpty()) return null;
+
+		String[] classNames = {
+				"com.simibubi.create.content.logistics.filter.FilterItemStack",
+				"com.simibubi.create.content.logistics.filter.FilterItemStack$FilterItemStack",
+				"com.simibubi.create.content.logistics.filter.ItemFilterStack",
+				"com.simibubi.create.content.logistics.filter.FilterItem",
+				"com.simibubi.create.content.logistics.filter.FilterItemStack$Impl",
+				"com.simibubi.create.content.logistics.filter.FilterItemStack$Simple"
+		};
+
+		String[] methodNames = {
+				"of",
+				"fromStack",
+				"fromItemStack",
+				"ofStack",
+				"from",
+				"create",
+				"fromFilterStack",
+				"wrap"
+		};
+
+		Level currentLevel = level;
+		Object provider = currentLevel != null ? currentLevel.registryAccess() : null;
+
+		for (String className : classNames) {
+			try {
+				Class<?> clazz = Class.forName(className);
+
+				Set<Method> methods = new LinkedHashSet<>();
+				methods.addAll(Arrays.asList(clazz.getMethods()));
+				methods.addAll(Arrays.asList(clazz.getDeclaredMethods()));
+
+				for (Method method : methods) {
+					if (!Modifier.isStatic(method.getModifiers())) continue;
+
+					boolean nameOk = false;
+
+					for (String name : methodNames) {
+						if (name.equals(method.getName())) {
+							nameOk = true;
+							break;
+						}
+					}
+
+					if (!nameOk) continue;
+
+					trySetAccessible(method);
+
+					Object ret = tryInvokeStaticObject(method, stack);
+					if (ret != null && isFilterWrapResult(ret)) return ret;
+
+					if (currentLevel != null) {
+						ret = tryInvokeStaticObject(method, stack, currentLevel);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeStaticObject(method, currentLevel, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+
+					if (provider != null) {
+						ret = tryInvokeStaticObject(method, stack, provider);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeStaticObject(method, provider, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+				}
+
+				for (Method method : methods) {
+					if (!Modifier.isStatic(method.getModifiers())) continue;
+
+					Class<?> retType = method.getReturnType();
+
+					if (retType == void.class || retType.isPrimitive()) continue;
+					if (retType == Boolean.class) continue;
+					if (Number.class.isAssignableFrom(retType)) continue;
+					if (retType == String.class) continue;
+
+					trySetAccessible(method);
+
+					Object ret = tryInvokeStaticObject(method, stack);
+					if (ret != null && isFilterWrapResult(ret)) return ret;
+
+					if (currentLevel != null) {
+						ret = tryInvokeStaticObject(method, stack, currentLevel);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeStaticObject(method, currentLevel, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+
+					if (provider != null) {
+						ret = tryInvokeStaticObject(method, stack, provider);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeStaticObject(method, provider, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+				}
+
+				for (Constructor<?> ctor : clazz.getDeclaredConstructors()) {
+					trySetAccessible(ctor);
+
+					Object ret = tryInvokeConstructor(ctor, stack);
+					if (ret != null && isFilterWrapResult(ret)) return ret;
+
+					if (currentLevel != null) {
+						ret = tryInvokeConstructor(ctor, stack, currentLevel);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeConstructor(ctor, currentLevel, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+
+					if (provider != null) {
+						ret = tryInvokeConstructor(ctor, stack, provider);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+
+						ret = tryInvokeConstructor(ctor, provider, stack);
+						if (ret != null && isFilterWrapResult(ret)) return ret;
+					}
+				}
+
+				CompoundTag tag = saveStackToTag(stack);
+				if (tag != null && level instanceof ServerLevel serverLevel) {
+					Object fromTag = tryStaticFilterParse(clazz, tag, serverLevel);
+					if (fromTag != null && isFilterWrapResult(fromTag)) return fromTag;
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return null;
+	}
+
+	private boolean isFilterWrapResult(Object obj) {
+		if (obj == null) return false;
+		if (obj instanceof ItemStack) return false;
+		if (isCreateFilterObject(obj)) return true;
+
+		String name = obj.getClass().getName().toLowerCase();
+		return name.contains("filter");
+	}
+
+	@Nullable
+	private CompoundTag saveStackToTag(ItemStack stack) {
+		return saveStackToTag(stack, level);
+	}
+
+	@Nullable
+	private CompoundTag saveStackToTag(ItemStack stack, @Nullable Level saveLevel) {
+		try {
+			if (saveLevel != null) {
+				Object saved = stack.save(saveLevel.registryAccess());
+
+				if (saved instanceof CompoundTag compound) {
+					return compound;
+				}
+			}
+		} catch (Throwable ignored) {
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Boolean tryCreateFilterMatch(Object filter, ItemStack stack) {
+		if (filter == null || stack == null || stack.isEmpty()) return null;
+		if (filter instanceof ItemStack) return null;
+
+		String[] names = {
+				"test",
+				"matches",
+				"matchesItem",
+				"matchesStack",
+				"itemMatches",
+				"testStack",
+				"testItem",
+				"accepts",
+				"isValid",
+				"filterTest",
+				"matchesFilter",
+				"testFilter",
+				"matchesItemStack",
+				"testItemStack",
+				"match",
+				"apply"
+		};
+
+		Level currentLevel = level;
+
+		Class<?> c = filter.getClass();
+		while (c != null && c != Object.class) {
+			Set<Method> methods = new LinkedHashSet<>();
+			methods.addAll(Arrays.asList(c.getMethods()));
+			methods.addAll(Arrays.asList(c.getDeclaredMethods()));
+
+			for (Method method : methods) {
+				String methodName = method.getName();
+
+				boolean wanted = false;
+
+				for (String name : names) {
+					if (name.equals(methodName)) {
+						wanted = true;
+						break;
+					}
+				}
+
+				if (!wanted) continue;
+
+				trySetAccessible(method);
+
+				Class<?>[] params = method.getParameterTypes();
+
+				try {
+					if (params.length == 1 && params[0].isAssignableFrom(ItemStack.class)) {
+						Object result = method.invoke(filter, stack);
+
+						if (result instanceof Boolean b) return b;
+					}
+
+					if (params.length == 2 && currentLevel != null) {
+						boolean p0Level = params[0].isAssignableFrom(currentLevel.getClass());
+						boolean p1Level = params[1].isAssignableFrom(currentLevel.getClass());
+
+						boolean p0Stack = params[0].isAssignableFrom(ItemStack.class);
+						boolean p1Stack = params[1].isAssignableFrom(ItemStack.class);
+
+						if (p0Level && p1Stack) {
+							Object result = method.invoke(filter, currentLevel, stack);
+
+							if (result instanceof Boolean b) return b;
+						}
+
+						if (p1Level && p0Stack) {
+							Object result = method.invoke(filter, stack, currentLevel);
+
+							if (result instanceof Boolean b) return b;
+						}
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+
+			c = c.getSuperclass();
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Boolean tryCreateFilterStaticMatch(ItemStack filterStack, ItemStack stack) {
+		if (filterStack.isEmpty()) return true;
+
+		String[] classNames = {
+				"com.simibubi.create.content.logistics.filter.FilterItemStack",
+				"com.simibubi.create.content.logistics.filter.FilterItem",
+				"com.simibubi.create.content.logistics.filter.Filtering"
+		};
+
+		String[] methodNames = {
+				"test",
+				"matches",
+				"matchesItem",
+				"matchesStack",
+				"itemMatches",
+				"testStack",
+				"testItem",
+				"filterTest",
+				"matchesFilter",
+				"testFilter",
+				"matchesItemStack",
+				"testItemStack",
+				"match"
+		};
+
+		Level currentLevel = level;
+		Object provider = currentLevel != null ? currentLevel.registryAccess() : null;
+
+		for (String className : classNames) {
+			try {
+				Class<?> clazz = Class.forName(className);
+
+				Set<Method> methods = new LinkedHashSet<>();
+				methods.addAll(Arrays.asList(clazz.getMethods()));
+				methods.addAll(Arrays.asList(clazz.getDeclaredMethods()));
+
+				for (Method method : methods) {
+					if (!Modifier.isStatic(method.getModifiers())) continue;
+
+					boolean nameOk = false;
+
+					for (String name : methodNames) {
+						if (name.equals(method.getName())) {
+							nameOk = true;
+							break;
+						}
+					}
+
+					if (!nameOk) continue;
+
+					trySetAccessible(method);
+
+					if (method.getParameterCount() == 2) {
+						Boolean result = tryInvokeStaticBoolean(method, filterStack, stack);
+						if (result != null) return result;
+
+						result = tryInvokeStaticBoolean(method, stack, filterStack);
+						if (result != null) return result;
+					}
+
+					if (method.getParameterCount() == 3) {
+						if (currentLevel != null) {
+							Boolean result = tryInvokeStaticBoolean(method, currentLevel, filterStack, stack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, currentLevel, stack, filterStack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, filterStack, currentLevel, stack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, filterStack, stack, currentLevel);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, stack, filterStack, currentLevel);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, stack, currentLevel, filterStack);
+							if (result != null) return result;
+						}
+
+						if (provider != null) {
+							Boolean result = tryInvokeStaticBoolean(method, provider, filterStack, stack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, provider, stack, filterStack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, filterStack, provider, stack);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, filterStack, stack, provider);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, stack, filterStack, provider);
+							if (result != null) return result;
+
+							result = tryInvokeStaticBoolean(method, stack, provider, filterStack);
+							if (result != null) return result;
+						}
+					}
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object tryInvokeStaticObject(Method method, Object... args) {
+		Class<?>[] params = method.getParameterTypes();
+
+		if (params.length != args.length) return null;
+
+		for (int i = 0; i < args.length; i++) {
+			if (args[i] == null) {
+				if (params[i].isPrimitive()) return null;
+			} else if (!params[i].isAssignableFrom(args[i].getClass())) {
+				return null;
+			}
+		}
+
+		try {
+			return unwrapOptional(method.invoke(null, args));
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	@Nullable
+	private Boolean tryInvokeStaticBoolean(Method method, Object... args) {
+		Object result = tryInvokeStaticObject(method, args);
+		return result instanceof Boolean b ? b : null;
+	}
+
+	@Nullable
+	private Object tryInvokeConstructor(Constructor<?> ctor, Object... args) {
+		Class<?>[] params = ctor.getParameterTypes();
+
+		if (params.length != args.length) return null;
+
+		for (int i = 0; i < args.length; i++) {
+			if (args[i] == null) {
+				if (params[i].isPrimitive()) return null;
+			} else if (!params[i].isAssignableFrom(args[i].getClass())) {
+				return null;
+			}
+		}
+
+		try {
+			return unwrapOptional(ctor.newInstance(args));
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	@Nullable
+	private Object getUnderlyingFilterStack(Object filter) {
+		if (filter == null) return null;
+
+		for (String getter : new String[]{
+				"getItemStack",
+				"getStack",
+				"getItem",
+				"getFilterStack",
+				"getFilter"
+		}) {
+			Object obj = unwrapOptional(invokeNoArg(filter, getter));
+
+			if (obj instanceof ItemStack stack) {
+				return stack;
+			}
+
+			if (obj != null && obj != filter && isCreateFilterObject(obj)) {
+				Object nested = getUnderlyingFilterStack(obj);
+
+				if (nested instanceof ItemStack stack) {
+					return stack;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private Object unwrapOptional(Object obj) {
+		if (obj instanceof Optional<?> optional) {
+			return optional.isPresent() ? optional.get() : null;
+		}
+
+		return obj;
+	}
+
+	@Nullable
+	private ItemStack parseFilterTag(CompoundTag tag, ServerLevel level) {
+		for (String key : new String[]{"Filter", "Item", "ItemStack", "Stack", "ItemFilter", "FilterItem"}) {
+			if (tag.contains(key)) {
+				try {
+					Optional<ItemStack> parsed = ItemStack.parse(level.registryAccess(), tag.get(key));
+
+					if (parsed.isPresent()) {
+						return parsed.get();
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private int countItemsAll(@Nullable Train train, Set<PhysicsBogeyBlockEntity> consist,
+							  Object filter, boolean countStacks) {
+		int total = 0;
+
+		total += countItemsInTrainCarriages(train, filter, countStacks);
+		total += countItemsInTrainSublevels(consist, filter, countStacks);
+
+		return total;
+	}
+
+	private int countFluidsAll(@Nullable Train train, Set<PhysicsBogeyBlockEntity> consist, Object filter) {
+		int total = 0;
+
+		total += countFluidsInTrainCarriages(train, filter);
+		total += countFluidsInTrainSublevels(consist, filter);
+
+		return total;
+	}
+
+	private int countItemsInTrainCarriages(@Nullable Train train, Object filter, boolean countStacks) {
+		if (train == null) return 0;
+
+		Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+
+		int total = 0;
+
+		Object carriages = getFieldValue(train, "carriages");
+		if (carriages == null) carriages = invokeNoArg(train, "getCarriages");
+
+		if (carriages instanceof Iterable<?> iterable) {
+			for (Object carriage : iterable) {
+				Object contraption = getContraption(carriage);
+
+				if (contraption != null) {
+					total += countItemsInObjectGraph(contraption, filter, countStacks, seen, 0);
+				} else {
+					total += countItemsInObjectGraph(carriage, filter, countStacks, seen, 0);
+				}
+			}
+		} else if (carriages != null && carriages.getClass().isArray()) {
+			int length = Array.getLength(carriages);
+
+			for (int i = 0; i < length; i++) {
+				Object carriage = Array.get(carriages, i);
+				Object contraption = getContraption(carriage);
+
+				if (contraption != null) {
+					total += countItemsInObjectGraph(contraption, filter, countStacks, seen, 0);
+				} else {
+					total += countItemsInObjectGraph(carriage, filter, countStacks, seen, 0);
+				}
+			}
+		} else {
+			total += countItemsInObjectGraph(train, filter, countStacks, seen, 0);
+		}
+
+		return total;
+	}
+
+	private int countFluidsInTrainCarriages(@Nullable Train train, Object filter) {
+		if (train == null) return 0;
+
+		Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+
+		int total = 0;
+
+		Object carriages = getFieldValue(train, "carriages");
+		if (carriages == null) carriages = invokeNoArg(train, "getCarriages");
+
+		if (carriages instanceof Iterable<?> iterable) {
+			for (Object carriage : iterable) {
+				Object contraption = getContraption(carriage);
+
+				if (contraption != null) {
+					total += countFluidsInObjectGraph(contraption, filter, seen, 0);
+				} else {
+					total += countFluidsInObjectGraph(carriage, filter, seen, 0);
+				}
+			}
+		} else if (carriages != null && carriages.getClass().isArray()) {
+			int length = Array.getLength(carriages);
+
+			for (int i = 0; i < length; i++) {
+				Object carriage = Array.get(carriages, i);
+				Object contraption = getContraption(carriage);
+
+				if (contraption != null) {
+					total += countFluidsInObjectGraph(contraption, filter, seen, 0);
+				} else {
+					total += countFluidsInObjectGraph(carriage, filter, seen, 0);
+				}
+			}
+		} else {
+			total += countFluidsInObjectGraph(train, filter, seen, 0);
+		}
+
+		return total;
+	}
+
+	private Object getContraption(Object carriage) {
+		if (carriage == null) return null;
+
+		Object contraption = invokeNoArg(carriage, "getContraption");
+		if (contraption != null) return contraption;
+
+		return getFieldValue(carriage, "contraption");
+	}
+
+	private int countItemsInObjectGraph(Object obj, Object filter, boolean countStacks, Set<Object> seen, int depth) {
+		if (obj == null || depth > MAX_OBJECT_GRAPH_DEPTH) return 0;
+
+		if (obj instanceof ItemStack stack) {
+			if (!stack.isEmpty() && itemMatches(filter, stack)) {
+				return countStacks ? 1 : stack.getCount();
+			}
+
+			return 0;
+		}
+
+		if (!seen.add(obj)) return 0;
+
+		if (obj instanceof IItemHandler handler) {
+			return countItemsHandler(handler, filter, countStacks);
+		}
+
+		if (obj instanceof Container container) {
+			return countContainer(container, filter, countStacks);
+		}
+
+		int total = 0;
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object value : map.values()) {
+				total += countItemsInObjectGraph(value, filter, countStacks, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object value : iterable) {
+				total += countItemsInObjectGraph(value, filter, countStacks, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				total += countItemsInObjectGraph(Array.get(obj, i), filter, countStacks, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		String name = obj.getClass().getSimpleName().toLowerCase();
+
+		if (depth == 0 || shouldDeepScanItemObject(name)) {
+			Class<?> cls = obj.getClass();
+
+			while (cls != null && cls != Object.class) {
+				for (Field field : cls.getDeclaredFields()) {
+					int modifiers = field.getModifiers();
+
+					if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+					trySetAccessible(field);
+
+					try {
+						total += countItemsInObjectGraph(field.get(obj), filter, countStacks, seen, depth + 1);
+					} catch (Throwable ignored) {
+					}
+				}
+
+				cls = cls.getSuperclass();
+			}
+		}
+
+		return total;
+	}
+
+	private int countFluidsInObjectGraph(Object obj, Object filter, Set<Object> seen, int depth) {
+		if (obj == null || depth > MAX_OBJECT_GRAPH_DEPTH) return 0;
+
+		if (obj instanceof FluidStack stack) {
+			if (!stack.isEmpty() && fluidMatches(filter, stack)) {
+				return stack.getAmount();
+			}
+
+			return 0;
+		}
+
+		if (!seen.add(obj)) return 0;
+
+		if (obj instanceof IFluidHandler handler) {
+			return countFluidsHandler(handler, filter);
+		}
+
+		int total = 0;
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object value : map.values()) {
+				total += countFluidsInObjectGraph(value, filter, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object value : iterable) {
+				total += countFluidsInObjectGraph(value, filter, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				total += countFluidsInObjectGraph(Array.get(obj, i), filter, seen, depth + 1);
+			}
+
+			return total;
+		}
+
+		String name = obj.getClass().getSimpleName().toLowerCase();
+
+		if (depth == 0 || shouldDeepScanFluidObject(name)) {
+			Class<?> cls = obj.getClass();
+
+			while (cls != null && cls != Object.class) {
+				for (Field field : cls.getDeclaredFields()) {
+					int modifiers = field.getModifiers();
+
+					if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+					trySetAccessible(field);
+
+					try {
+						total += countFluidsInObjectGraph(field.get(obj), filter, seen, depth + 1);
+					} catch (Throwable ignored) {
+					}
+				}
+
+				cls = cls.getSuperclass();
+			}
+		}
+
+		return total;
+	}
+
+	private boolean shouldDeepScanItemObject(String name) {
+		return name.contains("contraption")
+				|| name.contains("carriage")
+				|| name.contains("storage")
+				|| name.contains("inventory")
+				|| name.contains("vault")
+				|| name.contains("handler")
+				|| name.contains("mounted")
+				|| name.contains("chest")
+				|| name.contains("barrel")
+				|| name.contains("crate")
+				|| name.contains("cargo")
+				|| name.contains("item")
+				|| name.contains("smart")
+				|| name.contains("wrapper")
+				|| name.contains("package")
+				|| name.contains("stack")
+				|| name.contains("sublevel");
+	}
+
+	private boolean shouldDeepScanFluidObject(String name) {
+		return name.contains("contraption")
+				|| name.contains("carriage")
+				|| name.contains("storage")
+				|| name.contains("inventory")
+				|| name.contains("vault")
+				|| name.contains("tank")
+				|| name.contains("fluid")
+				|| name.contains("handler")
+				|| name.contains("mounted")
+				|| name.contains("cargo")
+				|| name.contains("smart")
+				|| name.contains("wrapper")
+				|| name.contains("package")
+				|| name.contains("stack")
+				|| name.contains("sublevel");
+	}
+
+	private int countItemsInTrainSublevels(Set<PhysicsBogeyBlockEntity> consist, Object filter, boolean countStacks) {
+		Set<Object> seenSubLevels = Collections.newSetFromMap(new IdentityHashMap<>());
+		Set<Object> seenObjects = Collections.newSetFromMap(new IdentityHashMap<>());
+		Set<Object> countedVaults = new HashSet<>();
+
+		int total = 0;
+
+		for (PhysicsBogeyBlockEntity bogey : consist) {
+			Level beLevel = bogey.getLevel();
+			if (beLevel == null) continue;
+
+			Object subLevel = getSubLevel(beLevel, bogey.getBlockPos(), bogey);
+
+			total += countItemsInSubLevelRecursive(
+					subLevel,
+					filter,
+					countStacks,
+					seenSubLevels,
+					seenObjects,
+					countedVaults,
+					0
+			);
+		}
+
+		return total;
+	}
+
+	private int countFluidsInTrainSublevels(Set<PhysicsBogeyBlockEntity> consist, Object filter) {
+		Set<Object> seenSubLevels = Collections.newSetFromMap(new IdentityHashMap<>());
+		Set<Object> seenObjects = Collections.newSetFromMap(new IdentityHashMap<>());
+
+		int total = 0;
+
+		for (PhysicsBogeyBlockEntity bogey : consist) {
+			Level beLevel = bogey.getLevel();
+			if (beLevel == null) continue;
+
+			Object subLevel = getSubLevel(beLevel, bogey.getBlockPos(), bogey);
+
+			total += countFluidsInSubLevelRecursive(
+					subLevel,
+					filter,
+					seenSubLevels,
+					seenObjects,
+					0
+			);
+		}
+
+		return total;
+	}
+
+	private int countItemsInSubLevelRecursive(Object subLevel, Object filter, boolean countStacks,
+											  Set<Object> seenSubLevels, Set<Object> seenObjects,
+											  Set<Object> countedVaults, int depth) {
+		if (subLevel == null || depth > SUBLEVEL_SCAN_DEPTH || !seenSubLevels.add(subLevel)) {
+			return 0;
+		}
+
+		int total = 0;
+
+		for (BlockEntity be : getSubLevelBlockEntities(subLevel)) {
+			if (!isCargoBlockEntity(be)) continue;
+			if (seenObjects.contains(be)) continue;
+
+			seenObjects.add(be);
+
+			if (isVaultBlockEntity(be)) {
+				Object vaultKey = getVaultKey(be);
+
+				if (vaultKey != null && !countedVaults.add(vaultKey)) {
+					continue;
+				}
+
+				total += countVaultBlockEntity(be, filter, countStacks);
+				continue;
+			}
+
+			int found = countItemsViaCapabilities(be, filter, countStacks);
+
+			if (found == 0) {
+				found = countItemsInObjectGraph(be, filter, countStacks, seenObjects, depth + 1);
+			}
+
+			total += found;
+		}
+
+		for (Object linked : getLinkedSubLevels(subLevel)) {
+			total += countItemsInSubLevelRecursive(
+					linked,
+					filter,
+					countStacks,
+					seenSubLevels,
+					seenObjects,
+					countedVaults,
+					depth + 1
+			);
+		}
+
+		return total;
+	}
+
+	private int countFluidsInSubLevelRecursive(Object subLevel, Object filter,
+											   Set<Object> seenSubLevels, Set<Object> seenObjects,
+											   int depth) {
+		if (subLevel == null || depth > SUBLEVEL_SCAN_DEPTH || !seenSubLevels.add(subLevel)) {
+			return 0;
+		}
+
+		int total = 0;
+
+		for (BlockEntity be : getSubLevelBlockEntities(subLevel)) {
+			if (!isCargoBlockEntity(be)) continue;
+			if (seenObjects.contains(be)) continue;
+
+			int found = countFluidsViaCapabilities(be, filter);
+
+			if (found == 0) {
+				found = countFluidsInObjectGraph(be, filter, seenObjects, depth + 1);
+			}
+
+			seenObjects.add(be);
+			total += found;
+		}
+
+		for (Object linked : getLinkedSubLevels(subLevel)) {
+			total += countFluidsInSubLevelRecursive(
+					linked,
+					filter,
+					seenSubLevels,
+					seenObjects,
+					depth + 1
+			);
+		}
+
+		total += countFluidsInObjectGraph(subLevel, filter, seenObjects, 0);
+
+		return total;
+	}
+
+	private boolean isVaultBlockEntity(BlockEntity be) {
+		if (be == null) return false;
+
+		if (be instanceof ItemVaultBlockEntity) {
+			return true;
+		}
+
+		String name = be.getClass().getName().toLowerCase();
+		return name.contains("vault")
+				|| name.contains("itemvault")
+				|| name.contains("storagevault");
+	}
+
+	private int countVaultBlockEntity(BlockEntity be, Object filter, boolean countStacks) {
+		if (be instanceof ItemVaultBlockEntity vault) {
+			Level level = vault.getLevel();
+			BlockPos controller = vault.getController();
+
+			if (level != null && controller != null) {
+				IItemHandler handler = level.getCapability(
+						Capabilities.ItemHandler.BLOCK,
+						controller,
+						null
+				);
+
+				if (handler != null) {
+					return countItemsHandler(handler, filter, countStacks);
+				}
+			}
+
+			Object inventory = unwrapOptional(invokeNoArg(vault, "getInventoryOfBlock"));
+			return countInventoryLike(inventory, filter, countStacks);
+		}
+
+		if (be instanceof IItemHandler handler) {
+			return countItemsHandler(handler, filter, countStacks);
+		}
+
+		if (be instanceof Container container) {
+			return countContainer(container, filter, countStacks);
+		}
+
+		String[] getters = {
+				"getInventory",
+				"getItemInventory",
+				"getHandler",
+				"getItemHandler",
+				"getStorage",
+				"getItems",
+				"getVaultInventory",
+				"getInventoryHandler",
+				"getContainedInventory",
+				"getStorageHandler",
+				"getItemStorage"
+		};
+
+		for (String getter : getters) {
+			Object inventory = unwrapOptional(invokeNoArg(be, getter));
+			int found = countInventoryLike(inventory, filter, countStacks);
+			if (found > 0) {
+				return found;
+			}
+		}
+
+		String[] fields = {
+				"inventory",
+				"itemInventory",
+				"handler",
+				"itemHandler",
+				"storage",
+				"items",
+				"vaultInventory",
+				"inventoryHandler",
+				"itemStorage"
+		};
+
+		for (String field : fields) {
+			Object inventory = getFieldValue(be, field);
+			int found = countInventoryLike(inventory, filter, countStacks);
+			if (found > 0) {
+				return found;
+			}
+		}
+
+		return countItemsInObjectGraph(
+				be,
+				filter,
+				countStacks,
+				Collections.newSetFromMap(new IdentityHashMap<>()),
+				0
+		);
+	}
+
+	@Nullable
+	private Object getVaultKey(BlockEntity be) {
+		if (be instanceof ItemVaultBlockEntity vault) {
+			BlockPos controller = vault.getController();
+
+			if (controller == null) {
+				controller = vault.getBlockPos();
+			}
+
+			Level level = vault.getLevel();
+			String dim = level != null ? level.dimension().location().toString() : "unknown";
+
+			return dim + ":" + controller.asLong();
+		}
+
+		return null;
+	}
+
+	private int countInventoryLike(Object inventory, Object filter, boolean countStacks) {
+		if (inventory == null) return 0;
+
+		if (inventory instanceof IItemHandler handler) {
+			return countItemsHandler(handler, filter, countStacks);
+		}
+
+		if (inventory instanceof Container container) {
+			return countContainer(container, filter, countStacks);
+		}
+
+		return countItemsInObjectGraph(
+				inventory,
+				filter,
+				countStacks,
+				Collections.newSetFromMap(new IdentityHashMap<>()),
+				0
+		);
+	}
+
+	private int countItemsViaCapabilities(BlockEntity be, Object filter, boolean countStacks) {
+		Level level = be.getLevel();
+		if (level == null) return 0;
+
+		for (Direction side : CAPABILITY_SIDES) {
+			try {
+				IItemHandler handler = level.getCapability(
+						Capabilities.ItemHandler.BLOCK,
+						be.getBlockPos(),
+						side
+				);
+
+				if (handler != null && handler.getSlots() > 0) {
+					return countItemsHandler(handler, filter, countStacks);
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return 0;
+	}
+
+	private int countFluidsViaCapabilities(BlockEntity be, Object filter) {
+		Level level = be.getLevel();
+		if (level == null) return 0;
+
+		for (Direction side : CAPABILITY_SIDES) {
+			try {
+				IFluidHandler handler = level.getCapability(
+						Capabilities.FluidHandler.BLOCK,
+						be.getBlockPos(),
+						side
+				);
+
+				if (handler != null && handler.getTanks() > 0) {
+					return countFluidsHandler(handler, filter);
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return 0;
+	}
+
+	private int countItemsHandler(IItemHandler handler, Object filter, boolean countStacks) {
+		int total = 0;
+
+		for (int slot = 0; slot < handler.getSlots(); slot++) {
+			ItemStack stack = handler.getStackInSlot(slot);
+
+			if (!stack.isEmpty() && itemMatches(filter, stack)) {
+				total += countStacks ? 1 : stack.getCount();
+			}
+		}
+
+		return total;
+	}
+
+	private int countFluidsHandler(IFluidHandler handler, Object filter) {
+		int total = 0;
+
+		for (int tank = 0; tank < handler.getTanks(); tank++) {
+			FluidStack stack = handler.getFluidInTank(tank);
+
+			if (!stack.isEmpty() && fluidMatches(filter, stack)) {
+				total += stack.getAmount();
+			}
+		}
+
+		return total;
+	}
+
+	private int countContainer(Container container, Object filter, boolean countStacks) {
+		int total = 0;
+
+		for (int slot = 0; slot < container.getContainerSize(); slot++) {
+			ItemStack stack = container.getItem(slot);
+
+			if (stack != null && !stack.isEmpty() && itemMatches(filter, stack)) {
+				total += countStacks ? 1 : stack.getCount();
+			}
+		}
+
+		return total;
+	}
+
+	private boolean itemMatches(Object filter, ItemStack stack) {
+		if (filter == null) {
+			return true;
+		}
+
+		if (stack == null || stack.isEmpty()) {
 			return false;
+		}
+
+		if (filter instanceof FilterItemStack createFilter) {
+			try {
+				if (createFilter.isEmpty()) {
+					return true;
+				}
+
+				if (level != null) {
+					return createFilter.test(level, stack);
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		Boolean createMatch = tryCreateFilterMatch(filter, stack);
+		if (createMatch != null) {
+			return createMatch;
+		}
+
+		if (filter instanceof ItemStack filterStack) {
+			if (filterStack.isEmpty()) {
+				return true;
+			}
+
+			Object wrapped = tryWrapAsCreateFilter(filterStack);
+			if (wrapped != null) {
+				Boolean wrappedMatch = tryCreateFilterMatch(wrapped, stack);
+
+				if (wrappedMatch != null) {
+					return wrappedMatch;
+				}
+			}
+
+			Boolean staticMatch = tryCreateFilterStaticMatch(filterStack, stack);
+			if (staticMatch != null) {
+				return staticMatch;
+			}
+
+			if (!ItemStack.isSameItem(filterStack, stack)) {
+				return false;
+			}
+
+			try {
+				Object patch = filterStack.getComponentsPatch();
+				Method isEmpty = patch.getClass().getMethod("isEmpty");
+				Object empty = isEmpty.invoke(patch);
+
+				if (empty instanceof Boolean b && b) {
+					return true;
+				}
+			} catch (Throwable ignored) {
+			}
+
+			return ItemStack.isSameItemSameComponents(filterStack, stack);
+		}
+
+		Object underlying = getUnderlyingFilterStack(filter);
+
+		if (underlying instanceof ItemStack underlyingStack && underlying != filter) {
+			return itemMatches(underlyingStack, stack);
+		}
+
+		return false;
+	}
+
+	private boolean fluidMatches(Object filter, Object fluid) {
+		if (filter == null) {
+			return true;
+		}
+
+		if (fluid == null) {
+			return false;
+		}
+
+		if (filter instanceof FilterItemStack createFilter && fluid instanceof FluidStack fluidStack) {
+			try {
+				if (createFilter.isEmpty()) {
+					return true;
+				}
+
+				if (level != null) {
+					return createFilter.test(level, fluidStack);
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		if (fluid instanceof FluidStack fluidStack) {
+			if (filter instanceof FluidStack filterStack) {
+				if (filterStack.isEmpty()) {
+					return true;
+				}
+
+				return filterStack.isFluidEqual(fluidStack);
+			}
+		}
+
+		try {
+			Object empty = invokeNoArg(filter, "isEmpty");
+
+			if (empty instanceof Boolean b && b) {
+				return true;
+			}
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			for (Method method : filter.getClass().getMethods()) {
+				if (method.getName().equals("isFluidEqual") && method.getParameterCount() == 1) {
+					Object result = method.invoke(filter, fluid);
+
+					if (result instanceof Boolean b) {
+						return b;
+					}
+				}
+			}
+		} catch (Throwable ignored) {
+		}
+
+		Object filterFluid = invokeNoArg(filter, "getFluid");
+		Object stackFluid = invokeNoArg(fluid, "getFluid");
+
+		if (filterFluid != null && stackFluid != null) {
+			return filterFluid.equals(stackFluid);
+		}
+
+		return false;
+	}
+
+	private boolean isCargoBlockEntity(BlockEntity be) {
+		if (be == null) return false;
+		if (be instanceof NavigationControllerBlockEntity) return false;
+
+		String name = be.getClass().getName().toLowerCase();
+
+		if (name.contains("navigation")) return false;
+		if (name.contains("station")) return false;
+		if (name.contains("depot")) return false;
+		if (name.contains("dockingconnector")) return false;
+		if (name.contains("controller")) return false;
+
+		if (name.contains("vault")
+				|| name.contains("tank")
+				|| name.contains("storage")
+				|| name.contains("container")
+				|| name.contains("inventory")
+				|| name.contains("chest")
+				|| name.contains("barrel")
+				|| name.contains("crate")
+				|| name.contains("cargo")
+				|| name.contains("smart")
+				|| name.contains("package")
+				|| name.contains("item")
+				|| name.contains("fluid")) {
+			return true;
+		}
+
+		Level level = be.getLevel();
+		if (level == null) return false;
+
+		try {
+			IItemHandler itemHandler = level.getCapability(
+					Capabilities.ItemHandler.BLOCK,
+					be.getBlockPos(),
+					(Direction) null
+			);
+
+			if (itemHandler != null && itemHandler.getSlots() > 0) return true;
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			IFluidHandler fluidHandler = level.getCapability(
+					Capabilities.FluidHandler.BLOCK,
+					be.getBlockPos(),
+					(Direction) null
+			);
+
+			if (fluidHandler != null && fluidHandler.getTanks() > 0) return true;
+		} catch (Throwable ignored) {
+		}
+
+		return false;
+	}
+
+	@Nullable
+	private Object getSableHelper() {
+		String[] classNames = {
+				"dev.ryanhcode.sable.Sable",
+				"dev.ryanhcode.sable.SableAPI",
+				"dev.ryanhcode.sable.api.SableAPI",
+				"dev.ryanhcode.sable.SableHelper",
+				"dev.ryanhcode.sable.api.SableHelper"
+		};
+
+		String[] fieldNames = {
+				"HELPER",
+				"API",
+				"INSTANCE",
+				"HELPER_INSTANCE",
+				"SABLE_HELPER",
+				"SABLE_API"
+		};
+
+		String[] methodNames = {
+				"getHelper",
+				"getInstance",
+				"getAPI",
+				"get",
+				"helper"
+		};
+
+		for (String className : classNames) {
+			try {
+				Class<?> clazz = Class.forName(className);
+
+				for (String fieldName : fieldNames) {
+					try {
+						Field field = clazz.getDeclaredField(fieldName);
+						trySetAccessible(field);
+
+						Object value = field.get(null);
+						if (value != null) return value;
+					} catch (Throwable ignored) {
+					}
+				}
+
+				for (String methodName : methodNames) {
+					try {
+						Method method = clazz.getMethod(methodName);
+						Object value = method.invoke(null);
+
+						if (value != null) return value;
+					} catch (Throwable ignored) {
+					}
+
+					try {
+						Method method = clazz.getDeclaredMethod(methodName);
+						trySetAccessible(method);
+
+						Object value = method.invoke(null);
+						if (value != null) return value;
+					} catch (Throwable ignored) {
+					}
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return null;
+	}
+
+	@Nullable
+	private Object findSubLevelLikeInObjectGraph(Object obj, int depth) {
+		if (obj == null || depth > 3) return null;
+		if (obj instanceof Level) return null;
+		if (obj instanceof ItemStack) return null;
+		if (obj instanceof FluidStack) return null;
+
+		if (isSubLevelLike(obj)) {
+			return obj;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object value : iterable) {
+				Object found = findSubLevelLikeInObjectGraph(value, depth + 1);
+				if (found != null) return found;
+			}
+
+			return null;
+		}
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object value : map.values()) {
+				Object found = findSubLevelLikeInObjectGraph(value, depth + 1);
+				if (found != null) return found;
+			}
+
+			return null;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				Object found = findSubLevelLikeInObjectGraph(Array.get(obj, i), depth + 1);
+				if (found != null) return found;
+			}
+
+			return null;
+		}
+
+		String name = obj.getClass().getName().toLowerCase();
+
+		if (depth < 2
+				|| name.contains("bogey")
+				|| name.contains("sable")
+				|| name.contains("sublevel")
+				|| name.contains("entity")
+				|| name.contains("carriage")
+				|| name.contains("controller")) {
+			Class<?> cls = obj.getClass();
+
+			while (cls != null && cls != Object.class) {
+				for (Field field : cls.getDeclaredFields()) {
+					int modifiers = field.getModifiers();
+
+					if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+					trySetAccessible(field);
+
+					try {
+						Object value = field.get(obj);
+						if (value == null || value == obj) continue;
+
+						Object found = findSubLevelLikeInObjectGraph(value, depth + 1);
+						if (found != null) return found;
+					} catch (Throwable ignored) {
+					}
+				}
+
+				cls = cls.getSuperclass();
+			}
+		}
+
+		return null;
+	}
+
+	private Object getSubLevel(Level level, BlockPos pos, @Nullable PhysicsBogeyBlockEntity bogey) {
+		Object helper = getSableHelper();
+
+		if (helper != null) {
+			String[] names = {
+					"getContaining",
+					"getContainingSubLevel",
+					"getSubLevelAt",
+					"getSubLevelContaining",
+					"getSubLevel",
+					"getSubLevelFor",
+					"getSubLevelFrom",
+					"getSubLevelByPosition"
+			};
+
+			for (String name : names) {
+				Object ret = invokeByName(helper, name, level, pos);
+				Object unwrapped = unwrapSubLevelCandidate(ret);
+
+				if (unwrapped != null && !(unwrapped instanceof Level) && !(unwrapped instanceof BlockEntity)) {
+					return unwrapped;
+				}
+
+				if (bogey != null) {
+					ret = invokeByName(helper, name, bogey);
+					unwrapped = unwrapSubLevelCandidate(ret);
+
+					if (unwrapped != null && !(unwrapped instanceof Level) && !(unwrapped instanceof BlockEntity)) {
+						return unwrapped;
+					}
+
+					ret = invokeByName(helper, name, bogey.getLevel(), bogey.getBlockPos());
+					unwrapped = unwrapSubLevelCandidate(ret);
+
+					if (unwrapped != null && !(unwrapped instanceof Level) && !(unwrapped instanceof BlockEntity)) {
+						return unwrapped;
+					}
+				}
+
+				ret = invokeByName(helper, name, pos);
+				unwrapped = unwrapSubLevelCandidate(ret);
+
+				if (unwrapped != null && !(unwrapped instanceof Level) && !(unwrapped instanceof BlockEntity)) {
+					return unwrapped;
+				}
+			}
+		}
+
+		if (bogey != null) {
+			for (String name : new String[]{
+					"getSubLevel",
+					"getContainingSubLevel",
+					"getSableSubLevel",
+					"getAttachedSubLevel"
+			}) {
+				Object ret = unwrapOptional(invokeNoArg(bogey, name));
+				Object unwrapped = unwrapSubLevelCandidate(ret);
+
+				if (unwrapped != null && !(unwrapped instanceof Level) && !(unwrapped instanceof BlockEntity)) {
+					return unwrapped;
+				}
+			}
+
+			Object found = findSubLevelLikeInObjectGraph(bogey, 0);
+			if (found != null) {
+				return found;
+			}
+		}
+
+		return null;
+	}
+
+	private Collection<BlockEntity> getSubLevelBlockEntities(Object subLevel) {
+		List<BlockEntity> result = new ArrayList<>();
+
+		String[] methodNames = {
+				"getBlockEntities",
+				"getAllBlockEntities",
+				"getBlockEntityList",
+				"getLoadedBlockEntities",
+				"getBlockEntityMap",
+				"getBlockEntityLookup",
+				"getBlockEntitySet",
+				"getBlockEntityCollection",
+				"getTileEntities",
+				"blockEntities"
+		};
+
+		for (String name : methodNames) {
+			Object obj = unwrapOptional(invokeByName(subLevel, name));
+			addBlockEntities(obj, result);
+
+			if (!result.isEmpty()) {
+				return result;
+			}
+		}
+
+		String[] fieldNames = {
+				"blockEntityList",
+				"blockEntities",
+				"blockEntityMap",
+				"blockEntitiesById",
+				"loadedBlockEntities",
+				"blockEntityLookup",
+				"blockEntitySet",
+				"blockEntityCollection"
+		};
+
+		for (String name : fieldNames) {
+			Object obj = getFieldValue(subLevel, name);
+			addBlockEntities(obj, result);
+
+			if (!result.isEmpty()) {
+				return result;
+			}
+		}
+
+		if (result.isEmpty()) {
+			collectBlockEntitiesFromObjectGraph(
+					subLevel,
+					result,
+					Collections.newSetFromMap(new IdentityHashMap<>()),
+					0
+			);
+		}
+
+		return result;
+	}
+
+	private void collectBlockEntitiesFromObjectGraph(Object obj, List<BlockEntity> out, Set<Object> seen, int depth) {
+		if (obj == null || depth > 4 || !seen.add(obj)) return;
+
+		if (obj instanceof BlockEntity be) {
+			out.add(be);
+			return;
+		}
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object value : map.values()) {
+				collectBlockEntitiesFromObjectGraph(value, out, seen, depth + 1);
+			}
+
+			return;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object value : iterable) {
+				collectBlockEntitiesFromObjectGraph(value, out, seen, depth + 1);
+			}
+
+			return;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				collectBlockEntitiesFromObjectGraph(Array.get(obj, i), out, seen, depth + 1);
+			}
+
+			return;
+		}
+
+		String name = obj.getClass().getSimpleName().toLowerCase();
+
+		if (depth == 0
+				|| name.contains("sublevel")
+				|| name.contains("sable")
+				|| name.contains("level")
+				|| name.contains("manager")
+				|| name.contains("storage")
+				|| name.contains("blockentity")) {
+			Class<?> cls = obj.getClass();
+
+			while (cls != null && cls != Object.class) {
+				for (Field field : cls.getDeclaredFields()) {
+					int modifiers = field.getModifiers();
+
+					if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+					trySetAccessible(field);
+
+					try {
+						collectBlockEntitiesFromObjectGraph(field.get(obj), out, seen, depth + 1);
+					} catch (Throwable ignored) {
+					}
+				}
+
+				cls = cls.getSuperclass();
+			}
+		}
+	}
+
+	private void addBlockEntities(Object obj, List<BlockEntity> result) {
+		if (obj instanceof Collection<?> collection) {
+			for (Object o : collection) {
+				if (o instanceof BlockEntity be) {
+					result.add(be);
+				}
+			}
+		} else if (obj instanceof Map<?, ?> map) {
+			for (Object o : map.values()) {
+				if (o instanceof BlockEntity be) {
+					result.add(be);
+				}
+			}
+		} else if (obj != null && obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				Object o = Array.get(obj, i);
+
+				if (o instanceof BlockEntity be) {
+					result.add(be);
+				}
+			}
+		}
+	}
+
+	private List<Object> getLinkedSubLevels(Object subLevel) {
+		List<Object> result = new ArrayList<>();
+
+		String[] methodNames = {
+				"getConnectedSubLevels",
+				"getLinkedSubLevels",
+				"getConnections",
+				"getConnected",
+				"getLinked",
+				"getConnectionDependencies",
+				"getDependencies",
+				"getAdjacentSubLevels",
+				"getAttachedSubLevels",
+				"getChildren",
+				"getConnectedLevels"
+		};
+
+		for (String name : methodNames) {
+			addSubLevelLikeObjects(invokeByName(subLevel, name), result);
+		}
+
+		String[] fieldNames = {
+				"connectedSubLevels",
+				"linkedSubLevels",
+				"connections",
+				"linked",
+				"connected",
+				"dependencies",
+				"adjacentSubLevels",
+				"attachedSubLevels",
+				"children"
+		};
+
+		for (String name : fieldNames) {
+			addSubLevelLikeObjects(getFieldValue(subLevel, name), result);
+		}
+
+		Object helper = getSableHelper();
+
+		if (helper != null) {
+			String[] helperNames = {
+					"getConnectedSubLevels",
+					"getLinkedSubLevels",
+					"getConnections",
+					"getConnected",
+					"getLinked",
+					"getAdjacentSubLevels",
+					"getAttachedSubLevels",
+					"getConnectedLevels",
+					"getNetwork",
+					"getGraph"
+			};
+
+			for (String name : helperNames) {
+				addSubLevelLikeObjects(invokeOneArg(helper, name, subLevel), result);
+			}
+		}
+
+		for (String ownerGetter : new String[]{
+				"getOwner",
+				"getEntity",
+				"getNetwork",
+				"getGraph",
+				"getStructure",
+				"getTrain",
+				"getCarriage",
+				"getBogey"
+		}) {
+			Object owner = unwrapOptional(invokeByName(subLevel, ownerGetter));
+
+			if (owner != null) {
+				for (String subGetter : new String[]{
+						"getSubLevels",
+						"getAllSubLevels",
+						"getConnectedSubLevels",
+						"getLinkedSubLevels",
+						"getAttachedSubLevels",
+						"subLevels"
+				}) {
+					addSubLevelLikeObjects(invokeByName(owner, subGetter), result);
+				}
+			}
+		}
+
+		Class<?> cls = subLevel.getClass();
+
+		while (cls != null && cls != Object.class) {
+			for (Field field : cls.getDeclaredFields()) {
+				int modifiers = field.getModifiers();
+
+				if (Modifier.isStatic(modifiers) || field.isSynthetic()) continue;
+
+				trySetAccessible(field);
+
+				try {
+					Object value = field.get(subLevel);
+					if (value == null || value == subLevel) continue;
+
+					addSubLevelLikeObjects(value, result);
+
+					Object nested = findSubLevelLikeInObjectGraph(value, 1);
+					if (nested != null && nested != subLevel) {
+						result.add(nested);
+					}
+				} catch (Throwable ignored) {
+				}
+			}
+
+			cls = cls.getSuperclass();
+		}
+
+		return result;
+	}
+
+	private void addSubLevelLikeObjects(Object obj, List<Object> result) {
+		addSubLevelLikeObjects(obj, result, 0);
+	}
+
+	private void addSubLevelLikeObjects(Object obj, List<Object> result, int depth) {
+		if (obj == null || depth > 6) return;
+
+		if (obj instanceof Optional<?> optional) {
+			if (optional.isPresent()) {
+				addSubLevelLikeObjects(optional.get(), result, depth + 1);
+			}
+
+			return;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object o : iterable) {
+				addSubLevelLikeObjects(o, result, depth + 1);
+			}
+
+			return;
+		}
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object o : map.values()) {
+				addSubLevelLikeObjects(o, result, depth + 1);
+			}
+
+			return;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				addSubLevelLikeObjects(Array.get(obj, i), result, depth + 1);
+			}
+
+			return;
+		}
+
+		for (String getter : new String[]{
+				"getSubLevel",
+				"getValue",
+				"get"
+		}) {
+			Object ret = unwrapOptional(invokeByName(obj, getter));
+
+			if (ret != null && ret != obj) {
+				addSubLevelLikeObjects(ret, result, depth + 1);
+				return;
+			}
+		}
+
+		if (isSubLevelLike(obj)) {
+			result.add(obj);
+		}
+	}
+
+	private Object unwrapSubLevelCandidate(Object obj) {
+		return unwrapSubLevelCandidate(obj, 0);
+	}
+
+	private Object unwrapSubLevelCandidate(Object obj, int depth) {
+		if (obj == null || depth > 4) return null;
+
+		if (obj instanceof Optional<?> optional) {
+			return optional.isPresent()
+					? unwrapSubLevelCandidate(optional.get(), depth + 1)
+					: null;
+		}
+
+		if (obj instanceof Iterable<?> iterable) {
+			for (Object o : iterable) {
+				Object unwrapped = unwrapSubLevelCandidate(o, depth + 1);
+				if (unwrapped != null) return unwrapped;
+			}
+
+			return null;
+		}
+
+		if (obj instanceof Map<?, ?> map) {
+			for (Object o : map.values()) {
+				Object unwrapped = unwrapSubLevelCandidate(o, depth + 1);
+				if (unwrapped != null) return unwrapped;
+			}
+
+			return null;
+		}
+
+		if (obj.getClass().isArray()) {
+			int length = Array.getLength(obj);
+
+			for (int i = 0; i < length; i++) {
+				Object unwrapped = unwrapSubLevelCandidate(Array.get(obj, i), depth + 1);
+				if (unwrapped != null) return unwrapped;
+			}
+
+			return null;
+		}
+
+		if (isSubLevelLike(obj)) {
+			return obj;
+		}
+
+		for (String getter : new String[]{
+				"getSubLevel",
+				"getValue",
+				"get"
+		}) {
+			Object ret = unwrapOptional(invokeByName(obj, getter));
+
+			if (ret != null && ret != obj) {
+				Object unwrapped = unwrapSubLevelCandidate(ret, depth + 1);
+				if (unwrapped != null) return unwrapped;
+			}
+		}
+
+		return null;
+	}
+
+	private boolean isSubLevelLike(Object obj) {
+		if (obj == null) return false;
+		if (obj instanceof Level) return false;
+		if (obj instanceof BlockEntity) return false;
+
+		String name = obj.getClass().getName().toLowerCase();
+
+		if (name.contains("sublevel")) {
+			return true;
+		}
+
+		if (hasNoArgMethod(obj, "getBlockEntities")
+				|| hasNoArgMethod(obj, "getAllBlockEntities")
+				|| hasNoArgMethod(obj, "getBlockEntityList")
+				|| hasNoArgMethod(obj, "getBlockEntityMap")
+				|| hasNoArgMethod(obj, "getBlockEntityLookup")) {
+			return true;
+		}
+
+		if (name.contains("sable")) {
+			return getFieldValue(obj, "blockEntities") != null
+					|| getFieldValue(obj, "blockEntityMap") != null
+					|| getFieldValue(obj, "blockEntityList") != null
+					|| getFieldValue(obj, "blockEntityLookup") != null;
+		}
+
+		return false;
+	}
+
+	private boolean hasNoArgMethod(Object obj, String name) {
+		for (Method method : obj.getClass().getMethods()) {
+			if (method.getName().equals(name) && method.getParameterCount() == 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private Object invokeOneArg(Object target, String methodName, Object arg) {
+		return invokeByName(target, methodName, arg);
+	}
+
+	private Object invokeByName(Object target, String methodName, Object... args) {
+		if (target == null) return null;
+
+		Class<?> c = target.getClass();
+
+		while (c != null && c != Object.class) {
+			for (Method method : c.getMethods()) {
+				Object result = tryInvokeReflected(method, target, methodName, args);
+				if (result != null) return result;
+			}
+
+			for (Method method : c.getDeclaredMethods()) {
+				Object result = tryInvokeReflected(method, target, methodName, args);
+				if (result != null) return result;
+			}
+
+			c = c.getSuperclass();
+		}
+
+		return null;
+	}
+
+	private Object tryInvokeReflected(Method method, Object target, String methodName, Object[] args) {
+		if (!method.getName().equals(methodName)) return null;
+		if (method.getParameterCount() != args.length) return null;
+
+		Class<?>[] params = method.getParameterTypes();
+
+		boolean ok = true;
+
+		for (int i = 0; i < args.length; i++) {
+			if (args[i] == null) {
+				if (params[i].isPrimitive()) {
+					ok = false;
+					break;
+				}
+			} else if (!params[i].isAssignableFrom(args[i].getClass())) {
+				ok = false;
+				break;
+			}
+		}
+
+		if (!ok) return null;
+
+		try {
+			trySetAccessible(method);
+			return unwrapOptional(method.invoke(target, args));
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	private Object getFieldValue(Object obj, String fieldName) {
+		Class<?> c = obj.getClass();
+
+		while (c != null && c != Object.class) {
+			try {
+				Field field = c.getDeclaredField(fieldName);
+				trySetAccessible(field);
+
+				return field.get(obj);
+			} catch (Throwable ignored) {
+			}
+
+			c = c.getSuperclass();
+		}
+
+		return null;
+	}
+
+	private Object invokeNoArg(Object target, String methodName) {
+		try {
+			Method method = findMethod(target.getClass(), methodName, 0);
+			if (method == null) return null;
+
+			return unwrapOptional(method.invoke(target));
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	private Method findMethod(Class<?> clazz, String name, int parameterCount) {
+		for (Method method : clazz.getMethods()) {
+			if (method.getName().equals(name) && method.getParameterCount() == parameterCount) {
+				return method;
+			}
+		}
+
+		return null;
+	}
+
+	private boolean compare(int value, int target, String operator) {
+		return switch (operator) {
+			case ">" -> value > target;
+			case "<" -> value < target;
+			case "<=" -> value <= target;
+			case "==" -> value == target;
+			default -> value >= target;
+		};
+	}
+
+	private void trySetAccessible(java.lang.reflect.AccessibleObject object) {
+		try {
+			object.trySetAccessible();
+		} catch (Throwable ignored) {
 		}
 	}
 
@@ -1398,12 +5037,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				: Math.min(currentEntry + 1, schedule.entries.size() - 1);
 
 		arrivedAtDestination = false;
+		departureHoldTicks = DEPARTURE_HOLD_TICKS;
 
 		resetConditionProgress();
 
 		lastDistance = Double.NaN;
-
 		currentPath = Collections.emptyList();
+
+		debugInfo = "";
 
 		schedule.savedProgress = currentEntry;
 		scheduleStack.set(AllDataComponents.TRAIN_SCHEDULE, schedule.write(registries));
@@ -1614,6 +5255,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		if (candidate.score() >= Double.MAX_VALUE) return false;
 		if (requireDirection && !candidate.matchesDirection()) return false;
 		if (requireValid && !candidate.valid()) return false;
+
 		return true;
 	}
 
@@ -1765,18 +5407,21 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				graph, point, n1, n2, targetStation, currentStation,
 				directionPreference, approaches, true, true
 		);
+
 		if (!result.isEmpty()) return result;
 
 		result = tryBuildBestStationPath(
 				graph, point, n1, n2, targetStation, currentStation,
 				directionPreference, approaches, false, true
 		);
+
 		if (!result.isEmpty()) return result;
 
 		result = tryBuildBestStationPath(
 				graph, point, n1, n2, targetStation, currentStation,
 				directionPreference, approaches, true, false
 		);
+
 		if (!result.isEmpty()) return result;
 
 		return tryBuildBestStationPath(
@@ -1794,6 +5439,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		forEachStorageBlockEntity(level, consist, station, be -> activateStoragePort(level, be, active));
 
 		level.updateNeighborsAt(worldPosition, getBlockState().getBlock());
+
 		setChanged();
 		sendData();
 	}
@@ -2017,6 +5663,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			return Component.translatable("simurail.navigation_controller.no_schedule");
 		}
 
+		if (debugInfo != null && !debugInfo.isEmpty()) {
+			return Component.literal(debugInfo);
+		}
+
 		if (lastMatchedStationName == null) {
 			return Component.translatable("simurail.navigation_controller.unknown_destination");
 		}
@@ -2049,13 +5699,21 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.hasDirectionSignBeenSet = false;
 		this.lastSourceSign = 1.0;
 		this.lastForwardSign = 0;
+		this.departureHoldTicks = 0;
 
 		this.currentTarget = null;
 		this.cachedTrain = null;
 		this.lastConditionTickTime = -1;
 
-		this.storagePortsActive = false;
+		this.debugInfo = "";
 
+		if (level instanceof ServerLevel sl) {
+			deactivateDockingConnectors(sl);
+			setStoragePortsActive(sl, Collections.<PhysicsBogeyBlockEntity>emptySet(), null, false);
+			updateCustomStationPresence(sl, null);
+		}
+
+		this.storagePortsActive = false;
 		this.activatedDockingConnectors.clear();
 		this.dockingConnectorsActive = false;
 
@@ -2070,10 +5728,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			this.currentEntry = 0;
 		}
 
-		if (level instanceof ServerLevel sl) {
-			updateCustomStationPresence(sl, null);
-		}
-
 		resetConditionProgress();
 
 		setChanged();
@@ -2083,10 +5737,26 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	@Override
 	public void remove() {
 		if (level instanceof ServerLevel sl) {
+			deactivateDockingConnectors(sl);
+
+			if (storagePortsActive) {
+				storagePortsActive = false;
+				forEachStorageBlockEntity(sl, Collections.<PhysicsBogeyBlockEntity>emptySet(), null,
+						be -> activateStoragePort(sl, be, false));
+			}
+
 			updateCustomStationPresence(sl, null);
 		}
 
 		super.remove();
+	}
+
+	/**
+	 * Kept only for source compatibility with older renderers/packets.
+	 * Storage overlay particles have been removed.
+	 */
+	public List<BlockPos> getStorageOverlayPositions() {
+		return Collections.emptyList();
 	}
 
 	@Override
@@ -2178,7 +5848,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		currentStation = null;
 		lastStationEdge = null;
+
 		activatedDockingConnectors.clear();
+		activeDockingPairs.clear();
 		dockingConnectorsActive = false;
+
+		debugInfo = "";
 	}
 }

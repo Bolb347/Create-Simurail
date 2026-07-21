@@ -10,6 +10,7 @@ import com.crystaelix.simurail.content.bogey.PhysicsBogeyVisual;
 import com.crystaelix.simurail.content.gangway_frame.GangwayFrameBlockEntity;
 import com.crystaelix.simurail.content.gangway_frame.GangwayFrameRenderer;
 import com.crystaelix.simurail.content.controller.NavigationControllerBlockEntity;
+import com.crystaelix.simurail.content.controller.NavigationControllerRenderer;
 import com.simibubi.create.foundation.data.CreateRegistrate;
 import com.tterrag.registrate.util.entry.BlockEntityEntry;
 
@@ -41,7 +42,7 @@ public class SimurailBlockEntities {
 	public static final BlockEntityEntry<NavigationControllerBlockEntity> NAVIGATION_CONTROLLER = REGISTRATE
 			.blockEntity("navigation_controller", NavigationControllerBlockEntity::new)
 			.visual(() -> com.simibubi.create.content.kinetics.transmission.SplitShaftVisual::new, false)
-			.renderer(() -> com.simibubi.create.content.kinetics.base.KineticBlockEntityRenderer::new)
+			.renderer(() -> NavigationControllerRenderer::new)
 			.validBlocks(SimurailBlocks.NAVIGATION_CONTROLLER)
 			.register();
 
