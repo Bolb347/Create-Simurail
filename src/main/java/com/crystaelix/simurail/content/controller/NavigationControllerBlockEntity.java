@@ -149,6 +149,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private static final float ACCEL_BASE = 0.25f;
 	private static final float ACCEL_SCALE = 0.25f;
 	private int departureHoldTicks = 0;
+	private boolean hasDeparted = false;
+	private int dockUndockDelayTicks = 0;
+	private boolean lastRedstoneOutput = false;
+	private static final double DEPARTURE_CLEAR_DISTANCE = 5.0;
 
 	private record ConnectorRef(ServerLevel level, BlockPos pos) {}
 	private record DockingPairRef(BlockPos a, BlockPos b) {
@@ -180,7 +184,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	}
 
 	public int getRedstoneSignal() {
-		return (arrivedAtDestination || storagePortsActive) ? 15 : 0;
+		return 0;
 	}
 
 	public ScrollValueBehaviour maxSpeedScroll;
@@ -321,14 +325,26 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			departureHoldTicks--;
 		}
 
+		if (dockUndockDelayTicks > 0) {
+			dockUndockDelayTicks--;
+		}
+
+		if (dockingConnectorsActive && level instanceof ServerLevel) {
+			for (ConnectorRef ref : activatedDockingConnectors) {
+				if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
+					setDockingConnectorPowered(connector, true);
+				}
+			}
+		}
+
 		if (arrivedAtDestination && currentTarget != null && level instanceof ServerLevel serverLevel) {
 			tickArrivalConditions(serverLevel);
 		}
 
 		tickCounter++;
 		if (tickCounter < EVALUATE_INTERVAL) return;
-
 		tickCounter = 0;
+
 		evaluateAndDrive();
 	}
 
@@ -346,7 +362,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		if (tickConditionsOnce(level, currentTarget.entry, cachedTrain, currentTarget.station, consist)) {
 			advanceEntry(currentTarget.schedule, level.registryAccess());
-			deactivateDockingConnectors(level);
 			setStoragePortsActive(level, consist, currentTarget.station, false);
 		}
 	}
@@ -371,22 +386,26 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		if (anchorBogey == null) {
 			clearOverridesOnConsist();
 			setSpeedMultiplier(0.0f);
-
 			currentTarget = null;
 			cachedTrain = null;
 			debugInfo = "No bogey found";
 			departureHoldTicks = 0;
+			hasDeparted = false;
+			dockUndockDelayTicks = 0;
 
 			if (level instanceof ServerLevel sl) {
 				deactivateDockingConnectors(sl);
 				setStoragePortsActive(sl, Collections.<PhysicsBogeyBlockEntity>emptySet(), null, false);
 				updateCustomStationPresence(sl, null);
 			}
-
 			return;
 		}
 
 		Set<PhysicsBogeyBlockEntity> consist = traverseConsist(anchorBogey);
+
+		if (hasDeparted && Math.abs(anchorBogey.getMovementSpeed()) > 0.1) {
+			hasDeparted = false;
+		}
 
 		Target target = resolveDestination(serverLevel, anchorBogey);
 		currentTarget = target;
@@ -638,8 +657,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 						double stopThreshold = frontStopOffset + FULL_STOP_DISTANCE;
 						double holdThreshold = frontStopOffset + ARRIVAL_HOLD_DISTANCE;
 
-						boolean shouldArrive = distance <= stopThreshold
-								|| (arrivedAtDestination && distance <= holdThreshold);
+						boolean shouldArrive = false;
+						if (departureHoldTicks <= 0) {
+							boolean canArrive = !hasDeparted || distance > DEPARTURE_CLEAR_DISTANCE;
+							if (canArrive) {
+								shouldArrive = distance <= stopThreshold
+										|| (arrivedAtDestination && distance <= holdThreshold);
+							}
+						}
 
 						if (shouldArrive) {
 							currentStation = target.station;
@@ -651,7 +676,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 							if (tickConditionsOnce(serverLevel, target.entry, cachedTrain, target.station, consist)) {
 								advanceEntry(target.schedule, level.registryAccess());
-								deactivateDockingConnectors(serverLevel);
 								setStoragePortsActive(serverLevel, consist, target.station, false);
 							}
 
@@ -675,6 +699,10 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 							double speedFraction = Math.clamp(desiredSpeed / maxLinearSpeed, 0.0, 1.0);
 
 							newMultiplier = (float) (speedFraction * gearRatio * this.directionSign);
+
+							if (Math.abs(newMultiplier) < 0.01f) {
+								newMultiplier = 0.0f;
+							}
 
 							if (Math.abs(newMultiplier) < 0.01f) {
 								newMultiplier = 0.0f;
@@ -735,19 +763,14 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 		}
 
-		if (departureHoldTicks > 0) {
-			newMultiplier = 0.0f;
-			brakeStrength = 1.0;
-		} else {
-			newMultiplier = clampAcceleration(newMultiplier);
-		}
-		boolean shouldDock = arrivedAtDestination;
+		boolean shouldStorage = arrivedAtDestination;
+		boolean shouldDock = arrivedAtDestination || departureHoldTicks > 0;
 
 		setStoragePortsActive(
 				serverLevel,
 				consist,
 				target != null ? target.station : null,
-				shouldDock
+				shouldStorage
 		);
 
 		updateDockingConnectors(
@@ -756,6 +779,18 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				target != null ? target.station : null,
 				shouldDock
 		);
+
+		if (departureHoldTicks > 0 || dockUndockDelayTicks > 0) {
+			newMultiplier = 0.0f;
+			brakeStrength = 1.0;
+		} else {
+			newMultiplier = clampAcceleration(newMultiplier);
+
+			if (hasDeparted) {
+				float maxDepartMultiplier = 0.25f;
+				newMultiplier = Math.copySign(Math.min(Math.abs(newMultiplier), maxDepartMultiplier), newMultiplier);
+			}
+		}
 
 		if (frontBogey == null && hasValidPath && n1ForSteering != null && n2ForSteering != null) {
 			Vec3 edgeForward = n2ForSteering.getLocation().getLocation()
@@ -795,7 +830,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 
 		if (level != null && !level.isClientSide()) {
-			level.updateNeighborsAt(worldPosition, getBlockState().getBlock());
+			boolean redstoneOutput = getRedstoneSignal() > 0;
+			if (redstoneOutput != lastRedstoneOutput) {
+				lastRedstoneOutput = redstoneOutput;
+				level.updateNeighborsAt(worldPosition, getBlockState().getBlock());
+			}
 		}
 	}
 
@@ -1265,68 +1304,59 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		}
 	}
 
-	private void updateDockingConnectors(ServerLevel level, Set<PhysicsBogeyBlockEntity> consist,
-										 @Nullable GlobalStation station, boolean active) {
+	private void updateDockingConnectors(
+			ServerLevel level,
+			Set<PhysicsBogeyBlockEntity> consist,
+			@Nullable GlobalStation station,
+			boolean active
+	) {
 		if (!active) {
 			deactivateDockingConnectors(level);
 			return;
 		}
 
-		List<DockingConnectorBlockEntity> trainConnectors = collectTrainDockingConnectors(consist);
+		if (dockingConnectorsActive) {
+			boolean anyValid = false;
 
+			Iterator<ConnectorRef> it = activatedDockingConnectors.iterator();
+			while (it.hasNext()) {
+				ConnectorRef ref = it.next();
+				BlockEntity be = ref.level().getBlockEntity(ref.pos());
+
+				if (be instanceof DockingConnectorBlockEntity connector && !connector.isRemoved()) {
+					setDockingConnectorPowered(connector, true);
+					anyValid = true;
+				} else {
+					it.remove();
+				}
+			}
+
+			if (anyValid) {
+				return;
+			}
+		}
 		Set<ConnectorRef> desired = new HashSet<>();
-		Set<ConnectorRef> previous = new HashSet<>(activatedDockingConnectors);
 
-		activatedDockingConnectors.clear();
-
-		for (DockingConnectorBlockEntity connector : trainConnectors) {
+		for (DockingConnectorBlockEntity connector : collectTrainDockingConnectors(consist)) {
 			if (connector.isRemoved()) {
 				continue;
 			}
-
 			if (!(connector.getLevel() instanceof ServerLevel connectorLevel)) {
 				continue;
 			}
 
-			ConnectorRef ref = new ConnectorRef(connectorLevel, connector.getBlockPos());
-
-			if (!desired.add(ref)) {
-				continue;
-			}
-
-			boolean isNew = !previous.contains(ref);
-
-			if (isNew) {
-				try {
-					connector.setVirtualLock(true);
-				} catch (Throwable ignored) {
-				}
-			}
-
-			setDockingConnectorPowered(connector, true);
+			desired.add(new ConnectorRef(connectorLevel, connector.getBlockPos()));
 		}
 
-		for (ConnectorRef ref : previous) {
-			if (!desired.contains(ref)) {
-				if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
-					try {
-						connector.setVirtualLock(false);
-					} catch (Throwable ignored) {
-					}
+		activatedDockingConnectors.clear();
 
-					try {
-						connector.unDock();
-					} catch (Throwable ignored) {
-					}
-
-					setDockingConnectorPowered(connector, false);
-				}
-
-				undockNearbyDockingConnectors(ref.level(), ref.pos(), desired);
+		for (ConnectorRef ref : desired) {
+			if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
+				activatedDockingConnectors.add(ref);
+				setDockingConnectorPowered(connector, true);
 			}
 		}
 
-		activatedDockingConnectors.addAll(desired);
 		dockingConnectorsActive = !activatedDockingConnectors.isEmpty();
 	}
 
@@ -1341,7 +1371,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 			}
 
 			Object subLevel = getSubLevel(beLevel, bogey.getBlockPos(), bogey);
-
 			collectDockingConnectorsInSubLevel(
 					subLevel,
 					result,
@@ -1353,10 +1382,12 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		return new ArrayList<>(result);
 	}
 
-	private void collectDockingConnectorsInSubLevel(Object subLevel,
-													Set<DockingConnectorBlockEntity> out,
-													Set<Object> seenSubLevels,
-													int depth) {
+	private void collectDockingConnectorsInSubLevel(
+			Object subLevel,
+			Set<DockingConnectorBlockEntity> out,
+			Set<Object> seenSubLevels,
+			int depth
+	) {
 		if (subLevel == null || depth > SUBLEVEL_SCAN_DEPTH || !seenSubLevels.add(subLevel)) {
 			return;
 		}
@@ -1382,59 +1413,12 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	private void deactivateDockingConnectors(ServerLevel level) {
 		for (ConnectorRef ref : activatedDockingConnectors) {
 			if (ref.level().getBlockEntity(ref.pos()) instanceof DockingConnectorBlockEntity connector) {
-				try {
-					connector.setVirtualLock(false);
-				} catch (Throwable ignored) {
-				}
-
-				try {
-					connector.unDock();
-				} catch (Throwable ignored) {
-				}
-
 				setDockingConnectorPowered(connector, false);
 			}
-
-			undockNearbyDockingConnectors(ref.level(), ref.pos(), Collections.<ConnectorRef>emptySet());
 		}
 
 		activatedDockingConnectors.clear();
 		dockingConnectorsActive = false;
-	}
-
-	private void undockNearbyDockingConnectors(ServerLevel level, BlockPos center, Set<ConnectorRef> skip) {
-		int r = DOCKING_CONNECTOR_SCAN_RADIUS;
-
-		BlockPos min = center.offset(-r, -r, -r);
-		BlockPos max = center.offset(r, r, r);
-
-		for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
-			BlockPos immutable = new BlockPos(pos.getX(), pos.getY(), pos.getZ());
-
-			if (immutable.distSqr(center) > DOCKING_CONNECTOR_MAX_PAIR_DISTANCE_SQ) {
-				continue;
-			}
-
-			ConnectorRef ref = new ConnectorRef(level, immutable);
-
-			if (skip.contains(ref)) {
-				continue;
-			}
-
-			if (level.getBlockEntity(immutable) instanceof DockingConnectorBlockEntity other) {
-				try {
-					other.setVirtualLock(false);
-				} catch (Throwable ignored) {
-				}
-
-				try {
-					other.unDock();
-				} catch (Throwable ignored) {
-				}
-
-				setDockingConnectorPowered(other, false);
-			}
-		}
 	}
 
 	private void setDockingConnectorPowered(DockingConnectorBlockEntity connector, boolean powered) {
@@ -1444,11 +1428,11 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		BlockPos pos = connector.getBlockPos();
 		BlockState state = connectorLevel.getBlockState(pos);
-
 		boolean changed = false;
 
-		if (state.hasProperty(BlockStateProperties.POWERED) && state.getValue(BlockStateProperties.POWERED) != powered) {
-			connectorLevel.setBlock(pos, state.setValue(BlockStateProperties.POWERED, powered), 2);
+		if (state.hasProperty(BlockStateProperties.POWERED)
+				&& state.getValue(BlockStateProperties.POWERED) != powered) {
+			connectorLevel.setBlock(pos, state.setValue(BlockStateProperties.POWERED, powered), 3);
 			changed = true;
 		}
 
@@ -1459,7 +1443,6 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 
 		if (changed) {
 			connector.setChanged();
-
 			try {
 				connector.sendData();
 			} catch (Throwable ignored) {
@@ -5037,6 +5020,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 				: Math.min(currentEntry + 1, schedule.entries.size() - 1);
 
 		arrivedAtDestination = false;
+		hasDeparted = true;
 		departureHoldTicks = DEPARTURE_HOLD_TICKS;
 
 		resetConditionProgress();
@@ -5483,14 +5467,21 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 	}
 
 	private boolean isStoragePortBlockEntity(BlockEntity be) {
+		if (be instanceof DockingConnectorBlockEntity) {
+			return false;
+		}
+
 		String name = be.getClass().getName().toLowerCase();
 
-		return name.contains("dockingconnector")
+		if (name.contains("dockingconnector")
 				|| name.contains("dockconnector")
-				|| name.contains("portablestorageinterface")
+				|| (name.contains("docking") && name.contains("connector"))) {
+			return false;
+		}
+
+		return name.contains("portablestorageinterface")
 				|| name.contains("portablefluidinterface")
-				|| name.contains("airshipstation")
-				|| (name.contains("docking") && name.contains("connector"));
+				|| name.contains("airshipstation");
 	}
 
 	private void activateStoragePort(ServerLevel level, BlockEntity be, boolean active) {
@@ -5700,7 +5691,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		this.lastSourceSign = 1.0;
 		this.lastForwardSign = 0;
 		this.departureHoldTicks = 0;
-
+		this.hasDeparted = false;
+		this.dockUndockDelayTicks = 0;
+		this.lastRedstoneOutput = false;
 		this.currentTarget = null;
 		this.cachedTrain = null;
 		this.lastConditionTickTime = -1;
@@ -5771,6 +5764,9 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		tag.putBoolean("Arrived", arrivedAtDestination);
 		tag.putFloat("Multiplier", currentSpeedMultiplier);
 		tag.putInt("DirectionSign", directionSign);
+		tag.putBoolean("HasDeparted", hasDeparted);
+		tag.putInt("DockUndockDelayTicks", dockUndockDelayTicks);
+		tag.putBoolean("LastRedstoneOutput", lastRedstoneOutput);
 
 		tag.putBoolean("LastMovingTowardsNode2", lastMovingTowardsNode2);
 		tag.putBoolean("HasLastMovingDirection", hasLastMovingDirection);
@@ -5811,6 +5807,7 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		currentSpeedMultiplier = tag.getFloat("Multiplier");
 
 		directionSign = tag.contains("DirectionSign") ? tag.getInt("DirectionSign") : 1;
+		hasDeparted = tag.contains("HasDeparted") && tag.getBoolean("HasDeparted");
 
 		if (tag.contains("HasLastMovingDirection")) {
 			hasLastMovingDirection = tag.getBoolean("HasLastMovingDirection");
@@ -5852,7 +5849,8 @@ public class NavigationControllerBlockEntity extends SplitShaftBlockEntity {
 		activatedDockingConnectors.clear();
 		activeDockingPairs.clear();
 		dockingConnectorsActive = false;
-
+		dockUndockDelayTicks = 0;
+		lastRedstoneOutput = false;
 		debugInfo = "";
 	}
 }
